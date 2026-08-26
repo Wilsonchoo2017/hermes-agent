@@ -1,15 +1,12 @@
-"""Global emergency stop (ESTOP) — a resumable pause for NEW work only.
+"""Kanban dispatch pause (ESTOP) — a resumable pause for NEW Kanban work only.
 
 ``hermes pause`` writes a sentinel file at ``$HERMES_HOME/ESTOP``;
-``hermes resume`` removes it. While the sentinel exists:
+``hermes resume`` removes it. While the sentinel exists, the embedded kanban
+dispatcher skips spawning new workers (``gateway/kanban_watchers.py``).
 
-* the cron scheduler skips dispatching due jobs (``cron/scheduler.py:tick``),
-* the embedded kanban dispatcher skips spawning workers
-  (``gateway/kanban_watchers.py``),
-* new gateway turns get a brief "Hermes is paused" reply instead of an
-  agent run (``gateway/run.py:_handle_message``).
-
-In-flight work is NEVER killed — this is pause-new-work, not panic/exit.
+Chat turns and cron dispatch are NOT gated by this sentinel — only Kanban
+worker spawns are. In-flight work is NEVER killed — this is pause-new-work,
+not panic/exit.
 The check is a single ``os.stat`` so callers may run it every tick; no
 caching beyond the OS is performed, so engaging/disengaging takes effect on
 the very next check.
@@ -120,23 +117,6 @@ def get_state() -> Optional[dict]:
     except (OSError, ValueError):
         pass
     return {"reason": reason, "engaged_at": engaged_at}
-
-
-def paused_reply() -> Optional[str]:
-    """Short user-facing notice for new gateway turns, or None if not paused."""
-    state = get_state()
-    if state is None:
-        return None
-    reason = state.get("reason")
-    if reason:
-        return (
-            f"⏸️ Hermes is paused ({reason}). New work is on hold; "
-            "run `hermes resume` to pick things back up."
-        )
-    return (
-        "⏸️ Hermes is paused. New work is on hold; "
-        "run `hermes resume` to pick things back up."
-    )
 
 
 def check_paused(component: str, logger: logging.Logger) -> bool:
