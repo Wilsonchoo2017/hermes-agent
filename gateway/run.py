@@ -16789,12 +16789,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
     async def _handle_pause_command(self, event: MessageEvent):
-        """`/pause [reason]` engages the global emergency stop; `/pause off`
-        (aliases: resume/stop) lifts it.
-
-        This is the in-band resume path for messaging-only operators — the
-        estop gate above deliberately lets recognized slash commands through
-        while paused so a user without host-shell access is never locked out.
+        """`/pause [reason]` engages the Kanban dispatch pause; `/pause off`
+        (aliases: resume/stop) lifts it. Chat and cron are unaffected.
         """
         from agent import estop
 
@@ -17193,77 +17189,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
-
-        # Global emergency stop (`hermes pause`): give new turns a brief
-        # paused notice instead of starting an agent run. Internal events
-        # (background-process completions from IN-FLIGHT work) bypass the
-        # gate — pause stops NEW work, it never kills or orphans running
-        # work. Placed after auth so unauthorized senders keep the normal
-        # silent/pairing behavior and can't probe pause state.
-        #
-        # Passthroughs (pause blocks new AGENT turns, not control traffic):
-        #   * recognized slash commands — /status, /help, /new, /approve and
-        #     friends must keep working while paused, and /pause off is the
-        #     in-band resume path for messaging-only users;
-        #   * replies owned by IN-FLIGHT work — a pending detached-update
-        #     prompt, clarify, slash-confirm, or dangerous-command approval,
-        #     plus any message steering a session whose agent is already
-        #     running. Swallowing those would stall work the pause promised
-        #     not to touch.
-        if not is_internal:
-            try:
-                from agent.estop import paused_reply as _estop_paused_reply
-                _paused_notice = _estop_paused_reply()
-            except ImportError:
-                _paused_notice = None
-            if _paused_notice is not None:
-                _estop_allow = False
-                _estop_cmd = None
-                try:
-                    _estop_cmd = event.get_command()
-                except Exception:
-                    _estop_cmd = None
-                if _estop_cmd:
-                    try:
-                        from hermes_cli.commands import (
-                            resolve_command as _resolve_estop_cmd,
-                        )
-                        _estop_allow = _resolve_estop_cmd(_estop_cmd) is not None
-                    except Exception:
-                        _estop_allow = False
-                if not _estop_allow:
-                    try:
-                        _estop_key = self._session_key_for_source(source)
-                        _estop_state = self._peek_session_state(_estop_key)
-                        if (
-                            _estop_state is not None
-                            and _estop_state.persistent.update_prompt_pending
-                        ):
-                            _estop_allow = True
-                        if not _estop_allow and self._is_session_running(_estop_key):
-                            # Steering / interrupting in-flight work (which
-                            # also covers pending clarify + tool approvals
-                            # held by the running agent).
-                            _estop_allow = True
-                        if not _estop_allow:
-                            from tools import slash_confirm as _estop_confirm_mod
-                            if _estop_confirm_mod.get_pending(_estop_key):
-                                _estop_allow = True
-                        if not _estop_allow:
-                            from tools.approval import (
-                                has_blocking_approval as _estop_has_approval,
-                            )
-                            if _estop_has_approval(_estop_key):
-                                _estop_allow = True
-                    except Exception:
-                        pass
-                if not _estop_allow:
-                    logger.info(
-                        "Gateway turn paused by global emergency stop (platform=%s chat=%s)",
-                        getattr(getattr(source, "platform", None), "value", "unknown"),
-                        getattr(source, "chat_id", None) or "unknown",
-                    )
-                    return _paused_notice
 
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
