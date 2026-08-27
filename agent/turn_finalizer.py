@@ -56,20 +56,51 @@ _VERIFICATION_CONTINUATION_FLAGS = (
 )
 
 
+# How much of the worker's closing summary is stored on the run. The retry
+# reads it back through ``build_worker_context``, which caps its own
+# rendering; this bound only keeps a pathological answer out of the DB.
+_KANBAN_SUMMARY_MAX_CHARS = 4000
+
+
 def _record_kanban_budget_exhausted(
     kanban_task: str,
     api_call_count: int,
     max_iterations: int,
     logger: logging.Logger,
+    summary=None,
 ) -> None:
     """Record a terminal ``timed_out`` outcome for a kanban worker that
     exhausted its iteration budget.
+
+    ``summary`` is the fallback answer the worker just produced — the
+    toolless "you are out of budget, summarise" call, or the verification
+    candidate preserved in its place. Storing it on the run is what lets the
+    next attempt continue instead of restarting: ``build_worker_context``
+    renders every closed run's summary into the retry's prompt, so without
+    it the retry inherits nothing but the string "Iteration budget
+    exhausted" and re-derives all of the dead attempt's work.
 
     This is a bounded fallback (#87096): the CAS invariant in ``_end_run``
     (``WHERE ended_at IS NULL``) guarantees idempotence — if another path
     already closed the run this is a no-op — so it is safe to call from
     multiple exit paths.
     """
+    summary_text = flatten_message_text(summary).strip() or None
+    if summary_text:
+        summary_text = summary_text[:_KANBAN_SUMMARY_MAX_CHARS]
+    else:
+        # Storing NULL here is what makes the retry a cold restart, and it used
+        # to happen silently: 13 of 13 budget-exhausted runs fleet-wide carried
+        # no summary and nothing said so. The bounded-fallback caller passes
+        # whatever the loop left behind, which is ``None`` whenever the turn was
+        # interrupted or failed before a summary could be composed -- legitimate,
+        # but the next attempt pays for it, so say which shape arrived.
+        logger.warning(
+            "Budget-exhausted run for task %s stored no summary (payload=%s) — "
+            "the retry inherits nothing and will re-derive this attempt's work",
+            kanban_task,
+            type(summary).__name__,
+        )
     try:
         from hermes_cli import kanban_db as _kb
         _conn = _kb.connect()
@@ -86,6 +117,7 @@ def _record_kanban_budget_exhausted(
                 outcome="timed_out",
                 release_claim=True,
                 end_run=True,
+                summary=summary_text,
                 event_payload_extra={
                     "budget_used": api_call_count,
                     "budget_max": max_iterations,
@@ -206,6 +238,7 @@ def finalize_turn(
         if _kanban_task:
             _record_kanban_budget_exhausted(
                 _kanban_task, api_call_count, agent.max_iterations, logger,
+                summary=final_response,
             )
     elif budget_exhausted:
         # Bounded fallback (#87096): budget was exhausted but none of the
@@ -220,6 +253,7 @@ def finalize_turn(
         if _kanban_task:
             _record_kanban_budget_exhausted(
                 _kanban_task, api_call_count, agent.max_iterations, logger,
+                summary=final_response,
             )
 
     # Determine if conversation completed successfully

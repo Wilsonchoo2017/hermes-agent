@@ -9159,6 +9159,7 @@ def _record_task_failure(
     force_trip: bool = False,
     release_claim: bool = False,
     end_run: bool = False,
+    summary: Optional[str] = None,
     event_payload_extra: Optional[dict] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
@@ -9184,6 +9185,13 @@ def _record_task_failure(
       run with the appropriate outcome. This just increments the
       counter; if the breaker trips, the task is re-transitioned
       into ``blocked`` and a ``gave_up`` event is emitted.
+
+    ``summary`` is what the *worker* had to say about the attempt before it
+    ended (the model's own account of what it did and what is left). It is
+    stored on the closed run, which is what ``build_worker_context`` reads
+    back to the next attempt — without it a retry restarts blind and
+    re-derives everything the dead attempt learned. Only paths that can
+    produce one pass it (budget exhaustion does; a crashed PID cannot).
 
     ``event_payload_extra`` merges into the ``gave_up`` event payload
     when the breaker trips, so callers can include outcome-specific
@@ -9260,6 +9268,7 @@ def _record_task_failure(
                 run_id = _end_run(
                     conn, task_id,
                     outcome="gave_up", status="gave_up",
+                    summary=summary,
                     error=error[:500],
                     metadata={
                         "failures": failures,
@@ -9306,6 +9315,7 @@ def _record_task_failure(
                 run_id = _end_run(
                     conn, task_id,
                     outcome=outcome, status=outcome,
+                    summary=summary,
                     error=error[:500],
                     metadata={
                         "failures": failures,
