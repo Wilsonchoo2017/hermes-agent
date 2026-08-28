@@ -3112,8 +3112,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     except Exception:
         pass
 
+    # The task name doubles as the notification title on platforms that
+    # surface one (e.g. ntfy's X-Title). Compute it once, before the wrap
+    # block, so it is available whether or not wrapping is enabled.
+    task_name = job.get("name", job.get("id", "cron task"))
+
     if wrap_response:
-        task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
         delivery_content = (
             f"Cronjob Response: {task_name}\n"
@@ -3531,6 +3535,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     # detection when "thread_id"/"message_thread_id" are absent
                     # from metadata, deriving the routing from target.thread_id
                     # or the explicit direct_messages_topic_id above.
+                    #
+                    # The job's task name becomes the notification title on
+                    # platforms that surface one (e.g. ntfy's X-Title header).
+                    # Add it to the live router metadata so
+                    # _deliver_to_platform forwards it to the adapter.
+                    route_metadata["title"] = task_name
                     future = safe_schedule_threadsafe(
                         router._deliver_to_platform(
                             route_target,
@@ -3813,7 +3823,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files, title=task_name)
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -3842,7 +3852,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files, title=task_name))
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)

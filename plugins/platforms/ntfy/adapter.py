@@ -426,6 +426,11 @@ class NtfyAdapter(BasePlatformAdapter):
         if markdown_enabled:
             headers["X-Markdown"] = "true"
 
+        # A metadata-supplied title becomes the ntfy notification title.
+        title = metadata.get("title") or ""
+        if title:
+            headers["X-Title"] = title[:200]
+
         if len(content) > self.MAX_MESSAGE_LENGTH:
             logger.warning(
                 "[%s] Message truncated from %d to %d chars (ntfy limit)",
@@ -519,6 +524,7 @@ async def _standalone_send(
     thread_id: Optional[str] = None,
     media_files: Optional[List[str]] = None,
     force_document: bool = False,
+    title: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Out-of-process publish for cron / send_message_tool fallbacks.
 
@@ -557,6 +563,9 @@ async def _standalone_send(
     headers = {"Content-Type": "text/plain; charset=utf-8", "X-Tags": _ECHO_TAG, **_build_auth_header(token)}
     if markdown_enabled:
         headers["X-Markdown"] = "true"
+
+    if title:
+        headers["X-Title"] = title[:200]
 
     body = _truncate_body(message, context="ntfy standalone")
 
