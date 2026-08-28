@@ -836,6 +836,7 @@ async def _send_via_adapter(
     thread_id=None,
     media_files=None,
     force_document=False,
+    title=None,
 ):
     """Send a message via a live gateway adapter, with a standalone fallback
     for out-of-process callers (e.g. cron running separately from the gateway).
@@ -868,6 +869,8 @@ async def _send_via_adapter(
                     metadata["thread_id"] = thread_id
                 if platform_name == "ntfy" and chat_id:
                     metadata["publish_topic"] = chat_id
+                if title:
+                    metadata["title"] = title
                 if not metadata:
                     metadata = None
                 result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
@@ -895,6 +898,7 @@ async def _send_via_adapter(
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document,
+                title=title,
             )
         except asyncio.CancelledError:
             raise
@@ -922,12 +926,14 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, args=None):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, args=None, title=None):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
     using the same smart-splitting algorithm as the gateway adapters
-    (preserves code-block boundaries, adds part indicators).
+    (preserves code-block boundaries, adds part indicators).  ``title`` is
+    the optional notification title surfaced on platforms that support one
+    (e.g. ntfy's X-Title header); cron passes the job's task name.
     """
     from gateway.config import Platform
 
@@ -1241,6 +1247,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 media_files=media_files if is_last else [],
                 force_document=force_document,
+                title=title,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -1309,6 +1316,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document,
+                title=title,
             )
 
         if isinstance(result, dict) and result.get("error"):
