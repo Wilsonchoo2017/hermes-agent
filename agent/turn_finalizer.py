@@ -56,6 +56,17 @@ _VERIFICATION_CONTINUATION_FLAGS = (
     "_pre_verify_synthetic",
 )
 
+# `handle_max_iterations` never returns empty — on every failure mode it
+# substitutes a placeholder (chat_completion_helpers.py:3165, 3230, 3232,
+# 3236). Persisting one would hand the next worker a prior-attempt block that
+# says nothing, so the retry would look resumed and would not be; the
+# exception variant would also pipe raw provider error text into a later
+# prompt. Treat them as the absence of a summary, which is what they are.
+_SUMMARY_PLACEHOLDERS = (
+    "I reached the iteration limit",
+    "I reached the maximum iterations",
+)
+
 
 def _record_kanban_budget_exhausted(
     kanban_task: str,
@@ -80,6 +91,8 @@ def _record_kanban_budget_exhausted(
     paid for an API call and got nothing, which is worth knowing.
     """
     cleaned = (summary or "").strip() or None
+    if cleaned and cleaned.startswith(_SUMMARY_PLACEHOLDERS):
+        cleaned = None
     if cleaned is None:
         logger.warning(
             "Budget-exhausted task %s produced no summary — the retry will "
@@ -237,9 +250,12 @@ def finalize_turn(
         # ``_end_run`` (``WHERE ended_at IS NULL``) guarantees idempotence.
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
+            # No summary call was made on this path (see comment above) —
+            # `final_response` is just whatever the last assistant turn
+            # happened to be, not a summary of the work. Don't mislabel it.
             _record_kanban_budget_exhausted(
                 _kanban_task, api_call_count, agent.max_iterations, logger,
-                summary=flatten_message_text(final_response),
+                summary=None,
             )
 
     # Determine if conversation completed successfully

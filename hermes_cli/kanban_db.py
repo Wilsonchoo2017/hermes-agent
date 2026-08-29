@@ -9278,6 +9278,12 @@ def _record_task_failure(
                     },
                 )
                 if run_id is None and summary:
+                    # Unlike the sibling `run_id is None` sites elsewhere in
+                    # this module (e.g. :6333, :6391), we log instead of
+                    # calling `_synthesize_ended_run` here: a synthetic row
+                    # would inflate the per-task attempt count that a later
+                    # policy derives from this same table, and the summary
+                    # already has nowhere real to land since the run is gone.
                     _log.warning(
                         "Task %s: run already closed, dropping a %d-char summary "
                         "(CAS lost to the crash detector)",

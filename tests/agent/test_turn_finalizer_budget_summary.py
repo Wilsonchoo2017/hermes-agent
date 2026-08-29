@@ -98,4 +98,58 @@ def test_a_present_summary_does_not_warn(recorded, caplog):
         _record_kanban_budget_exhausted("task-123", 60, 60, logger, summary="real work")
 
     assert recorded.call_args.kwargs["summary"] == "real work"
-    assert caplog.text == ""
+    assert "no summary" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "placeholder",
+    [
+        "I reached the iteration limit and couldn't generate a summary.",
+        "I reached the maximum iterations (60) but couldn't summarize. Error: boom",
+    ],
+)
+def test_placeholder_summary_is_treated_as_absent(recorded, caplog, placeholder):
+    """``_handle_max_iterations`` never returns empty — it substitutes one of
+    these two placeholders on every failure mode (chat_completion_helpers.py
+    :3165, :3230, :3232, :3236). Persisting either would hand the next
+    worker a prior-attempt block that says nothing (or leaks raw provider
+    error text), so both must be normalized to "no summary" just like a
+    blank string.
+    """
+    logger = logging.getLogger("test-budget-summary")
+
+    with caplog.at_level(logging.WARNING, logger="test-budget-summary"):
+        _record_kanban_budget_exhausted(
+            "task-123", 60, 60, logger, summary=placeholder,
+        )
+
+    assert recorded.call_args.kwargs["summary"] is None
+    assert "no summary" in caplog.text.lower()
+
+
+def test_budget_exhausted_without_summary_call_records_none(recorded, monkeypatch):
+    """The bounded fallback (``elif budget_exhausted:`` in finalize_turn) is
+    reached only when no summary call was ever made (interrupted / failed /
+    an anomalous exit_reason). It must not mislabel the last assistant turn
+    as a summary.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+    agent = _LimitAgent()
+
+    finalize_turn(
+        agent,
+        final_response={"role": "assistant", "content": "unrelated last turn"},
+        api_call_count=60,
+        interrupted=True,
+        failed=False,
+        messages=[{"role": "user", "content": "task"}],
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="task",
+        original_user_message="task",
+        _should_review_memory=False,
+        _turn_exit_reason="interrupted",
+    )
+
+    assert recorded.call_args.kwargs["summary"] is None
