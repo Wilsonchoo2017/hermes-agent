@@ -62,6 +62,7 @@ def _record_kanban_budget_exhausted(
     api_call_count: int,
     max_iterations: int,
     logger: logging.Logger,
+    summary: str | None = None,
 ) -> None:
     """Record a terminal ``timed_out`` outcome for a kanban worker that
     exhausted its iteration budget.
@@ -70,7 +71,22 @@ def _record_kanban_budget_exhausted(
     (``WHERE ended_at IS NULL``) guarantees idempotence — if another path
     already closed the run this is a no-op — so it is safe to call from
     multiple exit paths.
+
+    ``summary`` is the dying worker's own account of its work, produced by
+    the extra toolless call in ``_handle_max_iterations``. Persisting it is
+    the whole point of that call: ``build_worker_context`` reads prior
+    attempts' summaries, so the retry resumes instead of re-deriving. An
+    empty summary is logged rather than stored silently — it means the fleet
+    paid for an API call and got nothing, which is worth knowing.
     """
+    cleaned = (summary or "").strip() or None
+    if cleaned is None:
+        logger.warning(
+            "Budget-exhausted task %s produced no summary — the retry will "
+            "start cold (summary was %r)",
+            kanban_task,
+            summary,
+        )
     try:
         from hermes_cli import kanban_db as _kb
         _conn = _kb.connect()
@@ -87,6 +103,7 @@ def _record_kanban_budget_exhausted(
                 outcome="timed_out",
                 release_claim=True,
                 end_run=True,
+                summary=cleaned,
                 event_payload_extra={
                     "budget_used": api_call_count,
                     "budget_max": max_iterations,
@@ -207,6 +224,7 @@ def finalize_turn(
         if _kanban_task:
             _record_kanban_budget_exhausted(
                 _kanban_task, api_call_count, agent.max_iterations, logger,
+                summary=flatten_message_text(final_response),
             )
     elif budget_exhausted:
         # Bounded fallback (#87096): budget was exhausted but none of the
@@ -221,6 +239,7 @@ def finalize_turn(
         if _kanban_task:
             _record_kanban_budget_exhausted(
                 _kanban_task, api_call_count, agent.max_iterations, logger,
+                summary=flatten_message_text(final_response),
             )
 
     # Determine if conversation completed successfully
