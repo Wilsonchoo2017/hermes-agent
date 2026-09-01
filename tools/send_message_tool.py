@@ -952,6 +952,8 @@ async def _send_via_adapter(
     thread_id=None,
     media_files=None,
     force_document=False,
+    title=None,
+    priority=None,
 ):
     """Send a message via a live gateway adapter, with a standalone fallback
     for out-of-process callers (e.g. cron running separately from the gateway).
@@ -984,6 +986,10 @@ async def _send_via_adapter(
                     metadata["thread_id"] = thread_id
                 if platform_name == "ntfy" and chat_id:
                     metadata["publish_topic"] = chat_id
+                if title:
+                    metadata["title"] = title
+                if priority is not None:
+                    metadata["priority"] = priority
                 if not metadata:
                     metadata = None
                 # The adapter's send() uses asyncio.Queue + worker tasks bound
@@ -1080,6 +1086,12 @@ async def _send_via_adapter(
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document,
+                title=title,
+                # Only ntfy surfaces priority; other platforms' standalone
+                # senders would reject an unexpected kwarg.
+                **(  # type: ignore[misc]
+                    {"priority": priority} if platform_name == "ntfy" and priority is not None else {}
+                ),
             )
         except asyncio.CancelledError:
             raise
@@ -1109,12 +1121,16 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, args=None):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, args=None, title=None, priority=None):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
     using the same smart-splitting algorithm as the gateway adapters
-    (preserves code-block boundaries, adds part indicators).
+    (preserves code-block boundaries, adds part indicators).  ``title`` is
+    the optional notification title surfaced on platforms that support one
+    (e.g. ntfy's X-Title header); cron passes the job's task name.
+    ``priority`` (ntfy X-Priority, 1..5) is forwarded on platforms that
+    surface it; others ignore it.
     """
     from gateway.config import Platform
 
@@ -1440,6 +1456,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 media_files=media_files if is_last else [],
                 force_document=force_document,
+                title=title,
+                priority=priority,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -1459,6 +1477,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 media_files=media_files if is_last else None,
                 force_document=force_document,
+                title=title,
+                priority=priority,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -1529,6 +1549,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 media_files=media_files if i == len(chunks) - 1 else [],
                 force_document=force_document,
+                title=title,
+                priority=priority,
             )
 
         if isinstance(result, dict) and result.get("error"):

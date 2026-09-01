@@ -48,6 +48,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -144,6 +145,81 @@ def _truncate_body(message: str, *, context: str) -> bytes:
             context, len(message), MAX_MESSAGE_LENGTH,
         )
     return message[:MAX_MESSAGE_LENGTH].encode("utf-8")
+
+
+_URL_RE = re.compile(r"https?://[^\s<>\"')\]]+")
+
+
+def _click_header(message: str) -> Dict[str, str]:
+    """X-Click tap-target: the first URL in the message body, if any."""
+    m = _URL_RE.search(message or "")
+    return {"X-Click": m.group(0)} if m else {}
+
+
+# ntfy priority is an integer 1 (min) .. 5 (max/urgent); 3 is default.
+# Accept both the canonical int and the human labels ntfy documents so a
+# caller can pass priority="urgent" or priority=5 without friction.
+_PRIORITY_ALIASES = {
+    "min": 1,
+    "low": 2,
+    "default": 3,
+    "high": 4,
+    "urgent": 5,
+    "max": 5,
+}
+
+
+def _priority_header(priority: object) -> Dict[str, str]:
+    """X-Priority header from a caller-supplied priority.
+
+    Validates against ntfy's 1-5 range so a bad value never silently
+    degrades every notification to default. Returns {} when unset/invalid,
+    which leaves ntfy's own default (3) in effect.
+    """
+    if priority is None:
+        return {}
+    if isinstance(priority, str):
+        key = priority.strip().lower()
+        p = _PRIORITY_ALIASES.get(key)
+        if p is None and key.lstrip("+-").isdigit():
+            p = int(key)
+    elif isinstance(priority, bool):  # bool is an int subclass; reject it
+        p = None
+    elif isinstance(priority, int):
+        p = priority
+    else:
+        p = None
+    if p is None or p < 1 or p > 5:
+        logger.warning("[ntfy] ignoring invalid priority %r (want 1..5)", priority)
+        return {}
+    return {"X-Priority": str(p)}
+
+
+async def _publish_file(
+    client, server: str, topic: str, token: str, path: str, title: str = ""
+) -> Optional[str]:
+    """PUT one file to ntfy as a native attachment. Returns an error or None."""
+    import os as _os
+
+    headers = {
+        "Filename": _os.path.basename(path),
+        # Echo tag: without it the adapter reads its OWN attachment back off
+        # the subscribed topic and treats it as an inbound user message.
+        "X-Tags": _ECHO_TAG,
+        **_build_auth_header(token),
+    }
+    if title:
+        headers["X-Title"] = title[:200]
+    try:
+        with open(path, "rb") as fh:
+            resp = await client.put(
+                f"{server}/{topic}", content=fh.read(), headers=headers, timeout=120.0
+            )
+        if resp.status_code >= 300:
+            return f"ntfy attachment {path}: HTTP {resp.status_code}: {resp.text[:200]}"
+    except Exception as e:  # network / disk
+        return f"ntfy attachment {path}: {e}"
+    return None
 
 
 def check_requirements() -> bool:
@@ -424,9 +500,18 @@ class NtfyAdapter(BasePlatformAdapter):
             **self._auth_headers(),
             "Content-Type": "text/plain; charset=utf-8",
             "X-Tags": _ECHO_TAG,
+            **_click_header(content),
         }
         if markdown_enabled:
             headers["X-Markdown"] = "true"
+        # A metadata-supplied title becomes the ntfy notification title.
+        title = metadata.get("title") or ""
+        if title:
+            headers["X-Title"] = title[:200]
+        # A metadata-supplied priority becomes the ntfy X-Priority (1..5).
+        priority = metadata.get("priority")
+        if priority is not None:
+            headers.update(_priority_header(priority))
 
         if len(content) > self.MAX_MESSAGE_LENGTH:
             logger.warning(
@@ -454,6 +539,34 @@ class NtfyAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("[%s] Send error: %s", self.name, e)
             return SendResult(success=False, error=str(e))
+
+    async def _send_file(self, chat_id: str, path: str, metadata=None) -> SendResult:
+        """Publish a file as an ntfy attachment (used by all media routes)."""
+        metadata = metadata or {}
+        topic = metadata.get("publish_topic") or self._publish_topic or chat_id
+        if not self._http_client:
+            return SendResult(success=False, error="HTTP client not initialized")
+        err = await _publish_file(
+            self._http_client, self._server, topic, self._token, path,
+            title=metadata.get("title", ""),
+        )
+        if err:
+            logger.warning("[%s] %s", self.name, err)
+            return SendResult(success=False, error=err)
+        return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
+
+    # ntfy has one attachment primitive — every media kind maps onto it.
+    async def send_document(self, chat_id: str, file_path: str, metadata=None, **kw) -> SendResult:
+        return await self._send_file(chat_id, file_path, metadata)
+
+    async def send_image_file(self, chat_id: str, image_path: str, metadata=None, **kw) -> SendResult:
+        return await self._send_file(chat_id, image_path, metadata)
+
+    async def send_video(self, chat_id: str, video_path: str, metadata=None, **kw) -> SendResult:
+        return await self._send_file(chat_id, video_path, metadata)
+
+    async def send_voice(self, chat_id: str, audio_path: str, metadata=None, **kw) -> SendResult:
+        return await self._send_file(chat_id, audio_path, metadata)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """ntfy does not support typing indicators."""
@@ -521,6 +634,8 @@ async def _standalone_send(
     thread_id: Optional[str] = None,
     media_files: Optional[List[str]] = None,
     force_document: bool = False,
+    title: Optional[str] = None,
+    priority: Optional[object] = None,
 ) -> Dict[str, Any]:
     """Out-of-process publish for cron / send_message_tool fallbacks.
 
@@ -529,10 +644,13 @@ async def _standalone_send(
     ``hermes cron`` running standalone). Without this hook,
     ``deliver=ntfy`` cron jobs fail with ``No live adapter for platform``.
 
-    ``thread_id`` and ``media_files`` are accepted for signature parity
-    only — ntfy has no thread or attachment primitive. Markdown is
-    honored if ``NTFY_MARKDOWN`` is set OR ``pconfig.extra["markdown"]``
-    is True.
+    ``thread_id`` is accepted for signature parity only (ntfy has no
+    threads). ``media_files`` ARE delivered — each is PUT to the topic as
+    a native ntfy attachment after the text message. Markdown is honored
+    if ``NTFY_MARKDOWN`` is set OR ``pconfig.extra[markdown]`` is True.
+    ``title``, when provided, becomes the ntfy notification title
+    (X-Title header). ``priority``, when provided, becomes the ntfy
+    X-Priority (1..5; accepts labels like ``urgent``).
     """
     if not HTTPX_AVAILABLE:
         return {"error": "ntfy standalone send: httpx not installed"}
@@ -556,9 +674,18 @@ async def _standalone_send(
     markdown_env = os.getenv("NTFY_MARKDOWN", "").strip().lower()
     markdown_enabled = bool(extra.get("markdown")) or markdown_env in ("1", "true", "yes")
 
-    headers = {"Content-Type": "text/plain; charset=utf-8", "X-Tags": _ECHO_TAG, **_build_auth_header(token)}
+    headers = {
+        "Content-Type": "text/plain; charset=utf-8",
+        "X-Tags": _ECHO_TAG,
+        **_build_auth_header(token),
+        **_click_header(message),
+    }
     if markdown_enabled:
         headers["X-Markdown"] = "true"
+    if title:
+        headers["X-Title"] = title[:200]
+    if priority is not None:
+        headers.update(_priority_header(priority))
 
     body = _truncate_body(message, context="ntfy standalone")
 
@@ -573,6 +700,19 @@ async def _standalone_send(
             msg_id = data.get("id") or uuid.uuid4().hex[:12]
         except Exception:
             msg_id = uuid.uuid4().hex[:12]
+
+        errors = []
+        if media_files:
+            async with httpx.AsyncClient(timeout=None) as client:
+                for media_path, _is_voice in media_files:
+                    err = await _publish_file(
+                        client, server, publish_topic, token, str(media_path)
+                    )
+                    if err:
+                        logger.warning("%s", err)
+                        errors.append(err)
+        if errors:
+            return {"error": "; ".join(errors)}
         return {"success": True, "platform": "ntfy", "chat_id": publish_topic, "message_id": msg_id}
     except Exception as e:
         return {"error": f"ntfy standalone send failed: {e}"}
