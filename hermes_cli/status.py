@@ -126,7 +126,7 @@ def _estop_status_line():
         return None
     reason = state.get("reason")
     suffix = f" — reason: {reason}" if reason else ""
-    return f"⏸️  PAUSED (global emergency stop{suffix}; `hermes resume` to lift)"
+    return f"⏸️  KANBAN PAUSED{suffix}; `hermes resume` to lift"
 
 
 def show_status(args):
