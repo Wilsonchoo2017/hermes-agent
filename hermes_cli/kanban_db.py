@@ -9171,6 +9171,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    summary: Optional[str] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -9182,6 +9183,12 @@ def _record_task_failure(
 
     Returns True when the task was auto-blocked (counter reached
     ``failure_limit``), False when it was just updated in place.
+
+    ``summary`` is the dying attempt's own account of what it did, persisted
+    to ``task_runs.summary`` so ``build_worker_context`` can hand it to the
+    next attempt. Optional: most failure paths (crash, spawn failure) have no
+    worker left to ask. Not capped here — the read path caps at
+    ``_CTX_MAX_FIELD_BYTES``.
 
     Modes:
 
@@ -9272,6 +9279,7 @@ def _record_task_failure(
                     conn, task_id,
                     outcome="gave_up", status="gave_up",
                     error=error[:500],
+                    summary=summary,
                     metadata={
                         "failures": failures,
                         "trigger_outcome": outcome,
@@ -9280,6 +9288,19 @@ def _record_task_failure(
                         "retry_status": retry_status,
                     },
                 )
+                if run_id is None and summary:
+                    # Unlike the sibling `run_id is None` sites elsewhere in
+                    # this module (e.g. :6333, :6391), we log instead of
+                    # calling `_synthesize_ended_run` here: a synthetic row
+                    # would inflate the per-task attempt count that a later
+                    # policy derives from this same table, and the summary
+                    # already has nowhere real to land since the run is gone.
+                    _log.warning(
+                        "Task %s: run already closed, dropping a %d-char summary "
+                        "(CAS lost to the crash detector)",
+                        task_id,
+                        len(summary),
+                    )
             payload = {
                 "failures": failures,
                 "effective_limit": effective_limit,
@@ -9318,11 +9339,19 @@ def _record_task_failure(
                     conn, task_id,
                     outcome=outcome, status=outcome,
                     error=error[:500],
+                    summary=summary,
                     metadata={
                         "failures": failures,
                         "retry_status": retry_status,
                     },
                 )
+                if run_id is None and summary:
+                    _log.warning(
+                        "Task %s: run already closed, dropping a %d-char summary "
+                        "(CAS lost to the crash detector)",
+                        task_id,
+                        len(summary),
+                    )
                 _append_event(
                     conn, task_id, outcome,
                     {
