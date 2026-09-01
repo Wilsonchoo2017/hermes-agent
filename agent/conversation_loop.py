@@ -80,6 +80,7 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
     get_context_length_from_provider_error,
+    is_local_endpoint,
     is_output_cap_error,
     parse_available_output_tokens_from_error,
     save_context_length,
@@ -96,6 +97,8 @@ from agent.retry_utils import (
     adaptive_rate_limit_backoff,
     is_zai_coding_overload_error,
     jittered_backoff,
+    local_endpoint_down_backoff,
+    local_endpoint_down_retry_ceiling,
     zai_coding_overload_retry_ceiling,
 )
 from agent.repetition_guard import is_repetition_dominated
@@ -5682,6 +5685,16 @@ def run_conversation(
                 )
                 if _is_zai_coding_overload:
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+                # A transport failure against a LOCAL endpoint (the LiteLLM
+                # proxy on localhost, a LAN/Tailscale Ollama box) almost always
+                # means that process is restarting, not that it is gone. Its
+                # boot is measured in a minute, but the generic 2s-base backoff
+                # exhausts the default 3 attempts in ~20s, so a routine proxy
+                # restart fails every in-flight turn. Widen the window instead.
+                # See local_endpoint_down_retry_ceiling() for the sizing.
+                _is_local_endpoint_down = _is_transport_failure and is_local_endpoint(str(_base))
+                if _is_local_endpoint_down:
+                    max_retries = max(max_retries, local_endpoint_down_retry_ceiling())
                 _should_fallback = (
                     (is_rate_limited and _wrapped_output_cap_budget is None)
                     or (_is_transport_failure and retry_count >= 2)
@@ -6891,6 +6904,8 @@ def run_conversation(
                                 pass
                 wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                 _backoff_policy = None
+                if _is_local_endpoint_down and not _retry_after:
+                    wait_time = local_endpoint_down_backoff()
                 if (is_rate_limited or _is_zai_coding_overload) and not _retry_after:
                     wait_time, _backoff_policy = adaptive_rate_limit_backoff(
                         retry_count,
