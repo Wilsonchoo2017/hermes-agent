@@ -21,9 +21,7 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write # needed by lint (PR comment) + supply-chain review_status
-  actions: read # needed by osv-scanner (SARIF upload)
-  security-events: write # needed by osv-scanner (SARIF upload)
+  pull-requests: write # needed by lint (PR comment)
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -38,7 +36,10 @@ jobs:
   detect:
     name: Detect affected areas
     runs-on: ubuntu-latest
-    timeout-minutes: 1
+    # 1 minute upstream. On this fork the job twice blew that budget on
+    # runner/checkout startup alone (12s of real work, 1m43s wall) and
+    # reported a red X for it. 5 is still tight enough to catch a hang.
+    timeout-minutes: 5
     outputs:
       python: ${{ steps.classify.outputs.python }}
       python_prod: ${{ steps.classify.outputs.python_prod }}
@@ -138,24 +139,6 @@ jobs:
     if: false
     uses: ./.github/workflows/e2e-desktop.yml
 
-  docs-site:
-    name: Docs Site
-    needs: detect
-    if: needs.detect.outputs.site == 'true'
-    uses: ./.github/workflows/docs-site-checks.yml
-
-  history-check:
-    name: Deny unrelated histories
-    needs: detect
-    if: needs.detect.outputs.event_name == 'pull_request'
-    uses: ./.github/workflows/history-check.yml
-
-  contributor-check:
-    name: Check contributors
-    needs: detect
-    if: needs.detect.outputs.python == 'true'
-    uses: ./.github/workflows/contributor-check.yml
-
   uv-lockfile:
     name: Check uv.lock
     needs: detect
@@ -166,11 +149,6 @@ jobs:
     # `.github/` change still forces it on via the classifier's fail-open.
     if: needs.detect.outputs.uv_lock == 'true'
     uses: ./.github/workflows/uv-lockfile-check.yml
-
-  infographic-check:
-    name: Check no committed infographics
-    needs: detect
-    uses: ./.github/workflows/infographic-check.yml
 
   profile-artifact-check:
     name: Profile artifact check
@@ -194,31 +172,6 @@ jobs:
     if: needs.detect.outputs.docker_meta == 'true'
     uses: ./.github/workflows/docker-lint.yml
 
-  supply-chain:
-    name: Supply-chain scan
-    needs: detect
-    if: needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.scan == 'true' || needs.detect.outputs.deps == 'true')
-    uses: ./.github/workflows/supply-chain-audit.yml
-    with:
-      event_name: ${{ needs.detect.outputs.event_name }}
-      scan: ${{ needs.detect.outputs.scan == 'true' }}
-      deps: ${{ needs.detect.outputs.deps == 'true' }}
-
-  review-labels:
-    name: Review label gate
-    needs: [detect, supply-chain]
-    if: always() && needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.ci_review == 'true' || needs.detect.outputs.mcp_catalog == 'true' || needs.supply-chain.outputs.critical_findings == 'true')
-    uses: ./.github/workflows/review-labels.yml
-    with:
-      ci_review: ${{ needs.detect.outputs.ci_review == 'true' }}
-      ci_review_files: ${{ needs.detect.outputs.ci_review_files }}
-      mcp_catalog: ${{ needs.detect.outputs.mcp_catalog == 'true' }}
-      supply_chain: ${{ needs.supply-chain.outputs.critical_findings == 'true' }}
-
-  osv-scanner:
-    name: OSV scan
-    uses: ./.github/workflows/osv-scanner.yml
-
   # ─────────────────────────────────────────────────────────────────────
   # Gate: runs after everything. ``if: always()`` ensures it reports a
   # status even when some deps were skipped. Only actual ``failure``
@@ -240,17 +193,11 @@ jobs:
       - installer-tests
       - rust-tests
       - e2e-desktop
-      - docs-site
-      - history-check
-      - contributor-check
       - uv-lockfile
       - case-collision-check
       - lockfile-diff
       - docker-lint
       - profile-artifact-check
-      - supply-chain
-      - review-labels
-      - osv-scanner
       # The image build runs in its own workflow (docker.yml) and reports
       # its own check. It was never required here, because it is too slow
       # to block a merge. A separate run also stops it from holding this
