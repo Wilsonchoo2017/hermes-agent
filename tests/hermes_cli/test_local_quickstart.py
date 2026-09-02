@@ -52,9 +52,31 @@ def test_quickstart_refuses_when_nothing_fits(client, monkeypatch):
     assert "Local Models" in r.json()["detail"]
 
 
+def _generous_budget(monkeypatch):
+    """Pin the hardware budget so the fit check is not host-dependent.
+
+    Without this the two full-run tests below silently depend on the machine
+    having enough RAM/VRAM for some catalog entry: they pass on a large CI
+    runner and 409 ("no catalog model fits this machine") on a standard
+    4-core runner or a laptop. The legs under test are about sequencing, not
+    hardware selection, so the budget is fixed rather than probed.
+    """
+    from hermes_cli.local_runtime.estimator import HardwareBudget
+
+    gib = 1024 ** 3
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.hardware.probe_budget",
+        lambda **kw: HardwareBudget(
+            usable_vram_bytes=80 * gib,
+            total_device_bytes=80 * gib,
+            ram_available_bytes=128 * gib,
+        ))
+
+
 def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
     """Fresh machine: install runtime -> download recommended -> activate.
     Each leg is asserted by its observable call, in order."""
+    _generous_budget(monkeypatch)
     calls: list[str] = []
 
     # Leg 1: no runtime installed yet; install is the stubbed binaries call.
@@ -110,6 +132,7 @@ def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
 def test_quickstart_skips_satisfied_legs(client, monkeypatch):
     """Runtime present and model already staged: the response says so and
     the job goes straight to activation."""
+    _generous_budget(monkeypatch)
     calls: list[str] = []
 
     monkeypatch.setattr(
