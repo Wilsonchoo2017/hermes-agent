@@ -5229,6 +5229,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Initialize Rich console
         self.console = Console()
         self.config = CLI_CONFIG
+        # Last ``run_conversation`` result dict from ``chat()`` — ``chat()``
+        # only returns the response string, so the ``-q`` single-query path
+        # reads this to recover ``failed`` / ``failure_reason`` for its exit
+        # code. None when the turn raised.
+        self._last_chat_result = None
         self.compact = compact if compact is not None else CLI_CONFIG["display"].get("compact", False)
         # tool_progress: "off", "new", "all", "verbose" (from config.yaml display section)
         # YAML 1.1 parses bare `off` as boolean False — normalise to string.
@@ -17713,10 +17718,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 print(f"\n⏩ Delivering leftover /steer as next turn: '{preview}'")
                 self._pending_input.put(_leftover_steer)
 
+            self._last_chat_result = result
             return response
-            
+
         except Exception as e:
             print(f"Error: {e}")
+            self._last_chat_result = None
             return None
         finally:
             # Stop the ambient thinking sound the moment the turn ends —
@@ -22352,6 +22359,34 @@ def main(
                 cli._show_security_advisories()
                 cli.chat(query, images=single_query_images or None)
                 cli._print_exit_summary(clear_screen=False)
+
+                # Ensure proper exit code for automation wrappers.
+                #
+                # Kanban workers get a special case: when the run failed
+                # purely because the provider rate-limited / exhausted
+                # quota (not because the task itself is broken), exit with
+                # the EX_TEMPFAIL sentinel instead of the generic 1. The
+                # dispatcher's reap classifier maps that code to a
+                # ``rate_limited`` exit and releases the task back to
+                # ``ready`` WITHOUT incrementing the failure counter, so a
+                # 5-hour quota window can't trip the circuit breaker and
+                # permanently block the card. Non-kanban runs keep the
+                # plain 0/1 contract automation wrappers expect.
+                _result = getattr(cli, "_last_chat_result", None)
+                _exit_code = 0
+                if isinstance(_result, dict) and _result.get("failed"):
+                    _exit_code = 1
+                    if os.environ.get("HERMES_KANBAN_TASK") and _result.get(
+                        "failure_reason"
+                    ) in ("rate_limit", "billing"):
+                        try:
+                            from hermes_cli.kanban_db import (
+                                KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
+                            )
+                            _exit_code = _RL_CODE
+                        except Exception:
+                            _exit_code = 1
+                sys.exit(_exit_code)
         finally:
             _finalize_single_query(cli)
         return
