@@ -1,12 +1,14 @@
 ---
 name: repo-maintenance
-description: "Fast-forward a shared main checkout, collect landed worktrees, and discard edits proven to be upstream -- without authoring in main."
+description: "Fast-forward shared main; collect landed worktrees."
 version: 1.1.1
 author: Hermes Agent
 license: MIT
 platforms: [linux, macos]
 metadata:
   requires: [git, python3]
+  hermes:
+    tags: [git, worktree, maintenance, main-checkout, cleanup, fast-forward]
 ---
 
 # Repo maintenance on a shared main checkout
