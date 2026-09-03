@@ -909,6 +909,60 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error(f"kanban_block: {e}")
 
 
+def _handle_schedule(args: dict, **kw) -> str:
+    """Park the task in ``scheduled`` — a wait on a clock, not a person.
+
+    Unlike ``kanban_block`` (a person-wait that surfaces to a human), a
+    scheduled task is waiting on time: a login window, an external cron,
+    a dependency that resolves later. It does not pollute the human
+    decisions queue. An external cron, human, or automation later calls
+    ``kanban_unblock`` (or the CLI ``kanban unblock``) to re-gate it to
+    ``ready`` (or ``todo`` while parents remain open).
+    """
+    delegated_err = _reject_delegated_child_mutation("kanban_schedule")
+    if delegated_err:
+        return delegated_err
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    reason = args.get("reason")
+    if reason:
+        reason = redact_sensitive_text(str(reason), force=True)
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            ok = kb.schedule_task(
+                conn, tid,
+                reason=reason,
+                expected_run_id=_worker_run_id(tid),
+            )
+            if not ok:
+                return tool_error(
+                    f"could not schedule {tid} (unknown id or not in "
+                    f"todo/ready/running/blocked)"
+                )
+            run = kb.latest_run(conn, tid)
+            landed = kb.get_task(conn, tid)
+            return _ok(
+                task_id=tid,
+                run_id=run.id if run else None,
+                status=landed.status if landed else "scheduled",
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_schedule: {e}")
+    except Exception as e:
+        logger.exception("kanban_schedule failed")
+        return tool_error(f"kanban_schedule: {e}")
+
+
 def _handle_request_review(args: dict, **kw) -> str:
     """Move implementation into the first-class review phase."""
     delegated_err = _reject_delegated_child_mutation("kanban_request_review")
@@ -1920,6 +1974,39 @@ KANBAN_BLOCK_SCHEMA = {
     },
 }
 
+KANBAN_SCHEDULE_SCHEMA = {
+    "name": "kanban_schedule",
+    "description": (
+        "Park this task in 'scheduled' — a wait on a clock, not a person. "
+        "Use when the task is blocked on time (a login window, an external "
+        "cron, a dependency that resolves later) rather than on a human "
+        "decision. Unlike kanban_block, a scheduled task does NOT surface "
+        "to the human decisions queue. An external cron, human, or "
+        "automation later calls kanban_unblock (or the CLI `kanban "
+        "unblock`) to re-gate it to 'ready' (or 'todo' while parents "
+        "remain open)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "Optional reason / timing note (e.g. 'waiting for the "
+                    "login window at 09:00', 'waiting on external cron "
+                    "job X'). Stored on the run and event."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": [],
+    },
+}
+
 KANBAN_REQUEST_REVIEW_SCHEMA = {
     "name": "kanban_request_review",
     "description": (
@@ -2407,6 +2494,15 @@ registry.register(
     handler=_handle_block,
     check_fn=_check_kanban_mode,
     emoji="⏸",
+)
+
+registry.register(
+    name="kanban_schedule",
+    toolset="kanban",
+    schema=KANBAN_SCHEDULE_SCHEMA,
+    handler=_handle_schedule,
+    check_fn=_check_kanban_mode,
+    emoji="⏱",
 )
 
 registry.register(

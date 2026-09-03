@@ -228,6 +228,56 @@ def test_block_happy_path(worker_env):
         conn.close()
 
 
+def test_schedule_happy_path(worker_env):
+    """kanban_schedule parks a running task in 'scheduled' (a time-wait,
+    not a person-wait) and reports the landed status."""
+    from tools import kanban_tools as kt
+    out = kt._handle_schedule({"reason": "waiting for login window at 09:00"})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["status"] == "scheduled"
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "scheduled"
+    finally:
+        conn.close()
+
+
+def test_schedule_requires_task_id(monkeypatch, tmp_path):
+    """Without HERMES_KANBAN_TASK and without task_id, kanban_schedule
+    must refuse rather than guess a target."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from tools import kanban_tools as kt
+    out = kt._handle_schedule({"reason": "waiting"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "task_id is required" in d["error"]
+
+
+def test_schedule_rejects_foreign_task_id(worker_env):
+    """A worker scoped to its own task must not schedule a sibling task."""
+    from tools import kanban_tools as kt
+    out = kt._handle_schedule({"task_id": "some-other-task", "reason": "waiting"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "refusing to mutate" in d["error"]
+
+
+def test_schedule_registered_in_worker_schema(worker_env):
+    """The kanban_schedule tool must be registered and listed in the
+    worker toolset schema alongside the other kanban lifecycle tools."""
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
+    names = {s["function"].get("name") for s in schema if "function" in s}
+    assert "kanban_schedule" in names
+    assert "kanban_block" in names
+    assert "kanban_complete" in names
+
+
 def _make_goal_mode_worker_env(monkeypatch, tmp_path):
     """Set up an isolated HERMES_HOME with one claimed goal_mode task,
     matching the pattern used by the kanban_complete judge gate tests."""
