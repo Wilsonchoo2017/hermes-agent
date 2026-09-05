@@ -136,6 +136,22 @@ class TestPathResolution:
             fresh_home / "kanban" / "boards" / "other-board" / "kanban.db"
         )
 
+    def test_env_pin_wins_for_this_process_own_board(
+        self, fresh_home, tmp_path, monkeypatch
+    ):
+        """Naming your own board is not a cross-board send.
+
+        The gateway notifier and ``hermes kanban boards`` pass an explicit
+        slug they read back from ``list_boards()``, not one a user chose.
+        Refusing those stopped the notifier delivering anything at all
+        whenever ``HERMES_KANBAN_DB`` pointed at a file whose name did not
+        match the on-disk board layout.
+        """
+        forced = tmp_path / "wake-ok.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
+        assert kb.get_current_board() == "default"
+        assert kb.kanban_db_path(board="default") == forced
+
     def test_board_listing_survives_a_disagreeing_env_pin(
         self, fresh_home, tmp_path, monkeypatch
     ):

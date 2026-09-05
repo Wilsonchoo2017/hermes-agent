@@ -736,12 +736,19 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     3. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
        Other boards → ``<root>/kanban/boards/<slug>/kanban.db``.
 
-    An explicit ``board`` that disagrees with ``HERMES_KANBAN_DB`` raises
-    ``ValueError`` rather than silently resolving to the env var. Workers
-    run with that env var pinned to their own board, so preferring it
-    turned a cross-board send into a local write that still reported
-    success (fleetctl#350). Cross-board work routes through a caller that
-    has no ``HERMES_KANBAN_DB`` set.
+    A ``board`` naming a board *other than this process's own* while
+    ``HERMES_KANBAN_DB`` is pinned raises ``ValueError`` rather than
+    silently resolving to the env var. Workers run with that env var
+    pinned to their own board, so preferring it turned a cross-board send
+    into a local write that still reported success (fleetctl#350).
+    Cross-board work routes through a caller that has no
+    ``HERMES_KANBAN_DB`` set.
+
+    Naming *this* process's own board is not a contradiction, even when
+    the pin's filename differs from the on-disk layout. Board-scanning
+    loops (the gateway notifier, ``hermes kanban boards``) pass an
+    explicit slug they got from :func:`list_boards`, not a slug a user
+    chose — refusing those would silently stop the notifier delivering.
     """
     override = os.environ.get("HERMES_KANBAN_DB", "").strip()
     slug = _normalize_board_slug(board)
@@ -752,14 +759,16 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     path = _board_db_path(slug)
     if override:
         forced = Path(override).expanduser()
-        if os.path.realpath(forced) != os.path.realpath(path):
-            raise ValueError(
-                f"board={slug!r} resolves to {path}, but HERMES_KANBAN_DB "
-                f"pins {forced}. Refusing to write to a board the caller did "
-                f"not name — this process is pinned to its own board; route "
-                f"cross-board work through the orchestrator."
-            )
-        return forced
+        if os.path.realpath(forced) == os.path.realpath(path):
+            return forced
+        if slug == get_current_board():
+            return forced
+        raise ValueError(
+            f"board={slug!r} resolves to {path}, but HERMES_KANBAN_DB "
+            f"pins {forced}. Refusing to write to a board the caller did "
+            f"not name — this process is pinned to its own board; route "
+            f"cross-board work through the orchestrator."
+        )
     return path
 
 
