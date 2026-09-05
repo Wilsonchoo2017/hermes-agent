@@ -1378,6 +1378,24 @@ def _handle_create(args: dict, **kw) -> str:
             "assignee is required — name the profile that should execute this "
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
+    # A task addressed to a profile that doesn't exist is stored durably and
+    # never spawned: dispatch_once drops it into ``skipped_unassigned`` on
+    # every tick, forever, with no error anywhere (fleetctl#350).
+    try:
+        from hermes_cli.profiles import normalize_profile_name, profile_exists
+        assignee_known = profile_exists(normalize_profile_name(str(assignee)))
+    except ValueError:
+        assignee_known = False
+    except Exception:
+        # Profiles module unavailable (non-profile hosts, test rigs) —
+        # validation is best-effort and must not block the write.
+        assignee_known = True
+    if not assignee_known:
+        return tool_error(
+            f"assignee '{assignee}' is not a profile on this machine — the "
+            "dispatcher only spawns tasks whose assignee exists, so this task "
+            "would sit unread forever (see `hermes profile list`)"
+        )
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
@@ -1442,6 +1460,9 @@ def _handle_create(args: dict, **kw) -> str:
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
+        # Echo the board actually written to, so a caller can never mistake a
+        # local write for the cross-board send it asked for (fleetctl#350).
+        wrote_board = kb._normalize_board_slug(board) or kb.get_current_board()
         try:
             # A project link is safe to inherit because ``create_task`` turns
             # it into a fresh per-task worktree. Never inherit the parent's
@@ -1486,6 +1507,7 @@ def _handle_create(args: dict, **kw) -> str:
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
                 task_id=new_tid,
+                board=wrote_board,
                 status=new_task.status if new_task else None,
                 workspace_kind=new_task.workspace_kind if new_task else None,
                 workspace_path=new_task.workspace_path if new_task else None,
@@ -1701,7 +1723,9 @@ _DESC_BOARD = (
     "HERMES_KANBAN_BOARD env → the 'current' symlink under the kanban "
     "home → 'default'. Pass an explicit slug only when the caller (e.g. "
     "a Telegram routing layer) needs to override the env-pinned active "
-    "board for this one call."
+    "board for this one call. A slug that contradicts an env-pinned board "
+    "is refused, not silently ignored — dispatcher-spawned workers are "
+    "pinned to their own board and cannot write to another one."
 )
 
 

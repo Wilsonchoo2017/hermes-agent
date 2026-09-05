@@ -723,16 +723,35 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
        :func:`get_current_board` is used.
     3. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
        Other boards → ``<root>/kanban/boards/<slug>/kanban.db``.
+
+    An explicit ``board`` that disagrees with ``HERMES_KANBAN_DB`` raises
+    ``ValueError`` rather than silently resolving to the env var. Workers
+    run with that env var pinned to their own board, so preferring it
+    turned a cross-board send into a local write that still reported
+    success (fleetctl#350). Cross-board work routes through a caller that
+    has no ``HERMES_KANBAN_DB`` set.
     """
     override = os.environ.get("HERMES_KANBAN_DB", "").strip()
-    if override:
-        return Path(override).expanduser()
     slug = _normalize_board_slug(board)
     if slug is None:
+        if override:
+            return Path(override).expanduser()
         slug = get_current_board()
     if slug == DEFAULT_BOARD:
-        return kanban_home() / "kanban.db"
-    return board_dir(slug) / "kanban.db"
+        path = kanban_home() / "kanban.db"
+    else:
+        path = board_dir(slug) / "kanban.db"
+    if override:
+        forced = Path(override).expanduser()
+        if os.path.realpath(forced) != os.path.realpath(path):
+            raise ValueError(
+                f"board={slug!r} resolves to {path}, but HERMES_KANBAN_DB "
+                f"pins {forced}. Refusing to write to a board the caller did "
+                f"not name — this process is pinned to its own board; route "
+                f"cross-board work through the orchestrator."
+            )
+        return forced
+    return path
 
 
 def workspaces_root(board: Optional[str] = None) -> Path:
