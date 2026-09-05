@@ -710,6 +710,18 @@ def board_exists(board: Optional[str] = None) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
+def _board_db_path(slug: str) -> Path:
+    """Where board ``slug``'s DB lives on disk, ignoring any env pin.
+
+    Informational callers (board metadata, board listings) need this even
+    from a process pinned to a *different* board, so it must never refuse.
+    Use :func:`kanban_db_path` for anything that opens the DB.
+    """
+    if slug == DEFAULT_BOARD:
+        return kanban_home() / "kanban.db"
+    return board_dir(slug) / "kanban.db"
+
+
 def kanban_db_path(board: Optional[str] = None) -> Path:
     """Return the path to the ``kanban.db`` for ``board``.
 
@@ -737,10 +749,7 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
         if override:
             return Path(override).expanduser()
         slug = get_current_board()
-    if slug == DEFAULT_BOARD:
-        path = kanban_home() / "kanban.db"
-    else:
-        path = board_dir(slug) / "kanban.db"
+    path = _board_db_path(slug)
     if override:
         forced = Path(override).expanduser()
         if os.path.realpath(forced) != os.path.realpath(path):
@@ -883,7 +892,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
                 meta.update(raw)
     except (OSError, json.JSONDecodeError):
         pass
-    meta["db_path"] = str(kanban_db_path(slug))
+    meta["db_path"] = str(_board_db_path(slug))
     return meta
 
 
@@ -935,7 +944,7 @@ def write_board_metadata(
         json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    meta["db_path"] = str(kanban_db_path(slug))
+    meta["db_path"] = str(_board_db_path(slug))
     return meta
 
 

@@ -136,6 +136,29 @@ class TestPathResolution:
             fresh_home / "kanban" / "boards" / "other-board" / "kanban.db"
         )
 
+    def test_board_listing_survives_a_disagreeing_env_pin(
+        self, fresh_home, tmp_path, monkeypatch
+    ):
+        """Metadata reads stay informational — they must never refuse.
+
+        Every dispatcher-spawned worker runs with ``HERMES_KANBAN_DB``
+        pinned to its own board. If ``read_board_metadata`` inherited the
+        refusal, ``list_boards()`` would raise for any pin other than the
+        default board's DB, and the gateway's notifier tick — whose
+        ``except`` fallback is itself ``read_board_metadata(DEFAULT_BOARD)``
+        — would die instead of degrading.
+        """
+        kb.create_board("other-board")
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "custom.db"))
+        meta = kb.read_board_metadata("other-board")
+        assert meta["db_path"] == str(
+            fresh_home / "kanban" / "boards" / "other-board" / "kanban.db"
+        )
+        assert "other-board" in {b["slug"] for b in kb.list_boards()}
+        # The refusal still applies to anything that opens the DB.
+        with pytest.raises(ValueError):
+            kb.kanban_db_path(board="other-board")
+
 
 # ---------------------------------------------------------------------------
 # Current-board resolution
