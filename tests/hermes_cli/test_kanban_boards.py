@@ -99,11 +99,81 @@ class TestPathResolution:
 
 
     def test_env_var_db_override_still_wins(self, fresh_home, tmp_path, monkeypatch):
-        """``HERMES_KANBAN_DB`` pins the file regardless of board= arg."""
+        """``HERMES_KANBAN_DB`` pins the file when no board= arg is given."""
         forced = tmp_path / "custom.db"
         monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
         assert kb.kanban_db_path() == forced
-        assert kb.kanban_db_path(board="ignored") == forced
+
+    def test_env_var_disagreeing_with_board_arg_raises(
+        self, fresh_home, tmp_path, monkeypatch
+    ):
+        """An explicit board= the env var contradicts must not resolve.
+
+        Workers run with ``HERMES_KANBAN_DB`` pinned to their own board, so
+        silently preferring it turned a cross-board send into a local write
+        that still reported success (fleetctl#350).
+        """
+        forced = tmp_path / "custom.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
+        with pytest.raises(ValueError) as excinfo:
+            kb.kanban_db_path(board="other-board")
+        message = str(excinfo.value)
+        assert "other-board" in message
+        assert str(forced) in message
+
+    def test_env_var_agreeing_with_board_arg_resolves(
+        self, fresh_home, monkeypatch
+    ):
+        """Env var and board= naming the same DB is not a conflict."""
+        forced = fresh_home / "kanban.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
+        assert kb.kanban_db_path(board="default") == forced
+
+    def test_board_arg_without_env_var_resolves(self, fresh_home, monkeypatch):
+        """No ``HERMES_KANBAN_DB`` set: board= resolves as usual."""
+        monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+        assert kb.kanban_db_path(board="other-board") == (
+            fresh_home / "kanban" / "boards" / "other-board" / "kanban.db"
+        )
+
+    def test_env_pin_wins_for_this_process_own_board(
+        self, fresh_home, tmp_path, monkeypatch
+    ):
+        """Naming your own board is not a cross-board send.
+
+        The gateway notifier and ``hermes kanban boards`` pass an explicit
+        slug they read back from ``list_boards()``, not one a user chose.
+        Refusing those stopped the notifier delivering anything at all
+        whenever ``HERMES_KANBAN_DB`` pointed at a file whose name did not
+        match the on-disk board layout.
+        """
+        forced = tmp_path / "wake-ok.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
+        assert kb.get_current_board() == "default"
+        assert kb.kanban_db_path(board="default") == forced
+
+    def test_board_listing_survives_a_disagreeing_env_pin(
+        self, fresh_home, tmp_path, monkeypatch
+    ):
+        """Metadata reads stay informational — they must never refuse.
+
+        Every dispatcher-spawned worker runs with ``HERMES_KANBAN_DB``
+        pinned to its own board. If ``read_board_metadata`` inherited the
+        refusal, ``list_boards()`` would raise for any pin other than the
+        default board's DB, and the gateway's notifier tick — whose
+        ``except`` fallback is itself ``read_board_metadata(DEFAULT_BOARD)``
+        — would die instead of degrading.
+        """
+        kb.create_board("other-board")
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "custom.db"))
+        meta = kb.read_board_metadata("other-board")
+        assert meta["db_path"] == str(
+            fresh_home / "kanban" / "boards" / "other-board" / "kanban.db"
+        )
+        assert "other-board" in {b["slug"] for b in kb.list_boards()}
+        # The refusal still applies to anything that opens the DB.
+        with pytest.raises(ValueError):
+            kb.kanban_db_path(board="other-board")
 
 
 # ---------------------------------------------------------------------------

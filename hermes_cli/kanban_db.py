@@ -710,6 +710,18 @@ def board_exists(board: Optional[str] = None) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
+def _board_db_path(slug: str) -> Path:
+    """Where board ``slug``'s DB lives on disk, ignoring any env pin.
+
+    Informational callers (board metadata, board listings) need this even
+    from a process pinned to a *different* board, so it must never refuse.
+    Use :func:`kanban_db_path` for anything that opens the DB.
+    """
+    if slug == DEFAULT_BOARD:
+        return kanban_home() / "kanban.db"
+    return board_dir(slug) / "kanban.db"
+
+
 def kanban_db_path(board: Optional[str] = None) -> Path:
     """Return the path to the ``kanban.db`` for ``board``.
 
@@ -723,16 +735,41 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
        :func:`get_current_board` is used.
     3. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
        Other boards → ``<root>/kanban/boards/<slug>/kanban.db``.
+
+    A ``board`` naming a board *other than this process's own* while
+    ``HERMES_KANBAN_DB`` is pinned raises ``ValueError`` rather than
+    silently resolving to the env var. Workers run with that env var
+    pinned to their own board, so preferring it turned a cross-board send
+    into a local write that still reported success (fleetctl#350).
+    Cross-board work routes through a caller that has no
+    ``HERMES_KANBAN_DB`` set.
+
+    Naming *this* process's own board is not a contradiction, even when
+    the pin's filename differs from the on-disk layout. Board-scanning
+    loops (the gateway notifier, ``hermes kanban boards``) pass an
+    explicit slug they got from :func:`list_boards`, not a slug a user
+    chose — refusing those would silently stop the notifier delivering.
     """
     override = os.environ.get("HERMES_KANBAN_DB", "").strip()
-    if override:
-        return Path(override).expanduser()
     slug = _normalize_board_slug(board)
     if slug is None:
+        if override:
+            return Path(override).expanduser()
         slug = get_current_board()
-    if slug == DEFAULT_BOARD:
-        return kanban_home() / "kanban.db"
-    return board_dir(slug) / "kanban.db"
+    path = _board_db_path(slug)
+    if override:
+        forced = Path(override).expanduser()
+        if os.path.realpath(forced) == os.path.realpath(path):
+            return forced
+        if slug == get_current_board():
+            return forced
+        raise ValueError(
+            f"board={slug!r} resolves to {path}, but HERMES_KANBAN_DB "
+            f"pins {forced}. Refusing to write to a board the caller did "
+            f"not name — this process is pinned to its own board; route "
+            f"cross-board work through the orchestrator."
+        )
+    return path
 
 
 def workspaces_root(board: Optional[str] = None) -> Path:
@@ -864,7 +901,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
                 meta.update(raw)
     except (OSError, json.JSONDecodeError):
         pass
-    meta["db_path"] = str(kanban_db_path(slug))
+    meta["db_path"] = str(_board_db_path(slug))
     return meta
 
 
@@ -916,7 +953,7 @@ def write_board_metadata(
         json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    meta["db_path"] = str(kanban_db_path(slug))
+    meta["db_path"] = str(_board_db_path(slug))
     return meta
 
 
