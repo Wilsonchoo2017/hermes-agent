@@ -735,7 +735,7 @@ def sync_skills(quiet: bool = False) -> dict:
     bundled_dir = _get_bundled_dir()
     if not bundled_dir.exists():
         return {
-            "copied": [], "updated": [], "skipped": 0,
+            "copied": [], "updated": [], "restored": [], "skipped": 0,
             "user_modified": [], "cleaned": [], "suppressed": [], "total_bundled": 0,
             "optional_provenance_backfilled": [],
         }
@@ -764,6 +764,7 @@ def sync_skills(quiet: bool = False) -> dict:
     user_modified = []
     suppressed_skipped: List[str] = []
     relocated: List[str] = []
+    restored: List[str] = []
     skipped = 0
 
     for skill_name, skill_src in bundled_skills:
@@ -957,8 +958,31 @@ def sync_skills(quiet: bool = False) -> dict:
                 skipped += 1  # bundled unchanged, user unchanged
 
         else:
-            # ── In manifest but not on disk — user deleted it ──
-            skipped += 1
+            # ── In manifest but not on disk — restore it ──
+            # This used to be read as "the user deleted it" and skipped
+            # forever, which made every accidental loss permanent. A skill
+            # can go missing while its manifest entry survives for reasons
+            # that have nothing to do with intent: an interrupted copy, a
+            # partial profile clone (the manifest lives inside skills/, so
+            # it travels with the tree and can arrive describing files that
+            # did not), a stray rmtree. Nothing ever reconciled the two, so
+            # one bad moment removed a skill from a profile for good and
+            # `hermes update` reported nothing.
+            #
+            # The deliberate-removal signal is the curator suppression list,
+            # which is checked at the top of this loop — absence of a
+            # directory is not consent. Re-seed and report it.
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(skill_src, dest)
+                restored.append(skill_name)
+                manifest[skill_name] = bundled_hash
+                if not quiet:
+                    print(f"  ↻ {skill_name} (tracked but missing — restored)")
+            except (OSError, IOError) as e:
+                skipped += 1
+                if not quiet:
+                    print(f"  ! Failed to restore {skill_name}: {e}")
 
     # Clean stale manifest entries (skills removed from bundled dir).
     # Skip on an opted-out profile: bundled_skills was filtered to the
@@ -996,6 +1020,7 @@ def sync_skills(quiet: bool = False) -> dict:
     return {
         "copied": copied,
         "updated": updated,
+        "restored": restored,
         "skipped": skipped,
         "user_modified": user_modified,
         "cleaned": cleaned,
@@ -1465,6 +1490,8 @@ if __name__ == "__main__":
         if len(names) > MAX_SHOW:
             shown += f", +{len(names) - MAX_SHOW} more"
         parts.append(f"{len(names)} user-modified (kept): {shown}")
+    if result["restored"]:
+        parts.append(f"{len(result['restored'])} restored (tracked but missing)")
     if result["cleaned"]:
         parts.append(f"{len(result['cleaned'])} cleaned from manifest")
     if result.get("optional_provenance_backfilled"):

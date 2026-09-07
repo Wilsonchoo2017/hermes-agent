@@ -10561,7 +10561,7 @@ def _dispatch_once_locked(
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
         claimed.skills = list(
-            dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
+            dict.fromkeys([*(claimed.skills or []), REVIEW_FORCE_SKILL])
         )
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
@@ -10885,6 +10885,14 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+# The review lane force-loads this skill into every review worker (see the
+# dispatcher below). Named here so the spawn env can tell the worker which of
+# its ``--skills`` it did not ask for: a dispatcher-injected skill that fails
+# to resolve must not be treated as "this worker is fully misconfigured" and
+# kill it at startup (cli.py's preload check).
+REVIEW_FORCE_SKILL = "sdlc-review"
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -11036,6 +11044,13 @@ def _default_spawn(
         for sk in task.skills:
             if sk:
                 cmd.extend(["--skills", sk])
+        # Tell the worker which of those names the dispatcher chose for it.
+        # Without this the preload check cannot distinguish "the operator
+        # pinned a skill that does not exist" (worth failing on) from "the
+        # review lane injected its own skill and the install is missing it"
+        # (worth a loud warning, not a dead worker).
+        if REVIEW_FORCE_SKILL in task.skills:
+            env["HERMES_AUTOINJECTED_SKILLS"] = REVIEW_FORCE_SKILL
     if task.model_override:
         cmd.extend(["-m", task.model_override])
         # Pin the provider too when the override names one, so the worker

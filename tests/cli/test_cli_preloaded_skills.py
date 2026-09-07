@@ -134,6 +134,63 @@ def test_main_raises_for_unknown_preloaded_skill(monkeypatch):
         _real_finalize(created["cli"])
 
 
+def test_dispatcher_injected_skill_missing_does_not_hard_fail(monkeypatch):
+    """A skill the dispatcher injected is not evidence of a misconfigured worker.
+
+    The kanban review lane force-loads ``sdlc-review`` into every review
+    worker, and a review card usually requests nothing else — so the injected
+    name is the whole ``--skills`` list. Before this, one missing skill
+    directory killed the worker at "Initializing agent..." and auto-blocked
+    the card. It must warn and continue instead.
+    """
+    import cli as cli_mod
+
+    created = {}
+
+    def fake_cli(**kwargs):
+        created["cli"] = _DummyCLI(**kwargs)
+        return created["cli"]
+
+    monkeypatch.setattr(cli_mod, "HermesCLI", fake_cli)
+    monkeypatch.setattr(
+        cli_mod,
+        "build_preloaded_skills_prompt",
+        lambda skills, task_id=None: ("", [], ["sdlc-review"]),
+    )
+    monkeypatch.setenv(cli_mod.AUTO_INJECTED_SKILLS_ENV, "sdlc-review")
+
+    with pytest.raises(SystemExit):
+        cli_mod.main(skills="sdlc-review", list_tools=True)
+
+    # No raise: the worker starts, degraded, rather than dying at init.
+    _real_finalize(created["cli"])
+
+
+def test_user_requested_skill_still_hard_fails_alongside_injected(monkeypatch):
+    """The fail-loud contract survives for names the operator actually pinned."""
+    import cli as cli_mod
+
+    created = {}
+
+    def fake_cli(**kwargs):
+        created["cli"] = _DummyCLI(**kwargs)
+        return created["cli"]
+
+    monkeypatch.setattr(cli_mod, "HermesCLI", fake_cli)
+    monkeypatch.setattr(
+        cli_mod,
+        "build_preloaded_skills_prompt",
+        lambda skills, task_id=None: ("", [], ["sdlc-review", "typoed-skill"]),
+    )
+    monkeypatch.setenv(cli_mod.AUTO_INJECTED_SKILLS_ENV, "sdlc-review")
+
+    with pytest.raises(SystemExit):
+        cli_mod.main(skills="sdlc-review,typoed-skill", list_tools=True)
+
+    with pytest.raises(ValueError, match=r"typoed-skill"):
+        _real_finalize(created["cli"])
+
+
 def test_show_banner_does_not_print_skills():
     """show_banner() no longer prints the activated skills line — it moved to run()."""
     cli_obj = _make_real_cli(compact=False)

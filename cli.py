@@ -4976,6 +4976,27 @@ def build_skill_invocation_message(*args, **kwargs):
     return _impl(*args, **kwargs)
 
 
+# Skills the *dispatcher* injects into a worker rather than the user asking for
+# them by name (currently the kanban review lane's ``sdlc-review``). They are
+# passed through ``--skills`` like any other, so the preload check cannot tell
+# them apart — hence this env channel, set by the spawning dispatcher.
+#
+# Why it matters: the "every requested skill is missing" hard-fail exists to
+# stop a *misconfigured* worker running blind. A review card usually requests
+# nothing else, so the injected skill is the entire list, and one missing
+# directory turned a recoverable degradation into a worker that died at
+# "Initializing agent..." and auto-blocked the card after retries. An injected
+# skill going missing is an install problem to log, not a reason to refuse to
+# start.
+AUTO_INJECTED_SKILLS_ENV = "HERMES_AUTOINJECTED_SKILLS"
+
+
+def _auto_injected_skill_names() -> set:
+    """Names the dispatcher injected, from ``HERMES_AUTOINJECTED_SKILLS``."""
+    raw = os.environ.get(AUTO_INJECTED_SKILLS_ENV, "")
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
 def build_preloaded_skills_prompt(*args, **kwargs):
     from agent.skill_commands import build_preloaded_skills_prompt as _impl
 
@@ -8969,7 +8990,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # the worker (which auto-blocks the Kanban task after retries).
             # Only when EVERY requested skill is missing do we hard-fail, so a
             # fully-misconfigured worker fails loudly instead of running blind.
-            if loaded_skills:
+            #
+            # Dispatcher-injected skills never count toward that hard-fail: the
+            # user did not ask for them, so their absence says nothing about
+            # whether *this* worker was configured correctly.
+            user_requested_missing = [
+                name for name in missing_skills
+                if name not in _auto_injected_skill_names()
+            ]
+            if loaded_skills or not user_requested_missing:
                 logger.warning(
                     "Unknown skill(s) requested, skipping: %s. "
                     "Continuing with: %s. "

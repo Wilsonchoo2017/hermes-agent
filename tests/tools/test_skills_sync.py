@@ -382,8 +382,20 @@ class TestRenamedBundledSkillRecovery:
         assert "moved-skill" not in result.get("relocated", [])
         assert "hub-skill" not in result.get("relocated", [])
 
-    def test_genuine_user_deletion_still_respected(self, tmp_path):
-        """No copy anywhere on disk = a real deletion; must not be resurrected."""
+    def test_no_copy_on_disk_is_restored_not_relocated(self, tmp_path):
+        """No copy anywhere on disk = restore from bundled, not a relocation.
+
+        This used to assert the opposite ("a real deletion; must not be
+        resurrected"). Absence alone was the wrong signal: it cannot
+        distinguish a deliberate removal from an interrupted copy or a partial
+        profile clone, so it made every accidental loss permanent. Deliberate
+        removal is now expressed by the curator suppression list — covered by
+        ``TestSyncSkills.test_suppressed_skill_is_not_restored_when_missing``.
+
+        What this test still pins is the rename path: with nothing on disk to
+        move, the skill must arrive via a fresh copy and must NOT be reported
+        as relocated.
+        """
         bundled = tmp_path / "bundled"
         skills_dir = tmp_path / "user_skills"
         skills_dir.mkdir(parents=True, exist_ok=True)
@@ -395,9 +407,18 @@ class TestRenamedBundledSkillRecovery:
         with self._patches(bundled, skills_dir, manifest_file):
             result = sync_skills(quiet=True)
 
-        assert not (skills_dir / "newcat" / "moved-skill").exists()
-        assert "moved-skill" not in result["copied"]
+        assert (skills_dir / "newcat" / "moved-skill").exists()
+        assert "moved-skill" in result["restored"]
         assert "moved-skill" not in result.get("relocated", [])
+
+
+def _read_manifest_at(manifest_file):
+    """Parse a ``.bundled_manifest`` straight off disk (name -> origin hash)."""
+    return {
+        line.split(":", 1)[0]
+        for line in manifest_file.read_text().splitlines()
+        if line.strip()
+    }
 
 
 class TestSyncSkills:
@@ -442,6 +463,62 @@ class TestSyncSkills:
         assert "new-skill" in result["copied"]
         assert (skills_dir / "category" / "new-skill" / "SKILL.md").exists()
 
+    def test_tracked_but_missing_skill_is_restored(self, tmp_path):
+        """A manifest-tracked skill whose directory vanished must come back.
+
+        Absence is not consent. The directory can go missing for reasons that
+        have nothing to do with intent — an interrupted copy, a partial
+        profile clone (``.bundled_manifest`` lives inside ``skills/``, so it
+        travels with the tree and can arrive describing files that did not),
+        a stray rmtree. Treating that as "the user deleted it" made every
+        accidental loss permanent and silent.
+        """
+        import shutil
+
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            first = sync_skills(quiet=True)
+            assert "new-skill" in first["copied"]
+
+            # Lose the directory while the manifest entry survives — the exact
+            # divergence a partial clone or interrupted copy leaves behind.
+            shutil.rmtree(skills_dir / "category" / "new-skill")
+            assert "new-skill" in _read_manifest_at(manifest_file)
+
+            second = sync_skills(quiet=True)
+
+        assert "new-skill" in second["restored"]
+        assert (skills_dir / "category" / "new-skill" / "SKILL.md").exists()
+        assert (skills_dir / "category" / "new-skill" / "main.py").exists()
+
+    def test_suppressed_skill_is_not_restored_when_missing(self, tmp_path):
+        """Suppression, not absence, is the deliberate-removal signal.
+
+        A curator-pruned built-in must stay pruned across updates — the
+        restore path must never resurrect it.
+        """
+        import shutil
+
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            sync_skills(quiet=True)
+            shutil.rmtree(skills_dir / "old-skill")
+            with patch(
+                "tools.skills_sync._read_suppressed_names",
+                return_value={"old-skill"},
+            ):
+                result = sync_skills(quiet=True)
+
+        assert "old-skill" in result["suppressed"]
+        assert "old-skill" not in result["restored"]
+        assert not (skills_dir / "old-skill").exists()
+
     def test_fresh_install_copies_all_and_records_origin_hashes(self, tmp_path):
         bundled = self._setup_bundled(tmp_path)
         skills_dir = tmp_path / "user_skills"
@@ -463,9 +540,16 @@ class TestSyncSkills:
         assert len(manifest["new-skill"]) == 32
         assert len(manifest["old-skill"]) == 32
 
-    def test_user_deleted_skill_not_re_added_and_stale_entries_cleaned(self, tmp_path):
-        """In manifest but not on disk = user deleted it; don't re-add. And a
-        manifest entry no longer present in bundled gets cleaned out."""
+    def test_tracked_but_missing_restored_and_stale_entries_cleaned(self, tmp_path):
+        """In manifest but not on disk = restore it. And a manifest entry no
+        longer present in bundled still gets cleaned out.
+
+        Previously asserted "user deleted it; don't re-add" — see
+        ``test_tracked_but_missing_skill_is_restored`` for why absence is the
+        wrong signal, and
+        ``test_suppressed_skill_is_not_restored_when_missing`` for the one
+        that still holds.
+        """
         bundled = self._setup_bundled(tmp_path)
         skills_dir = tmp_path / "user_skills"
         manifest_file = skills_dir / ".bundled_manifest"
@@ -480,7 +564,8 @@ class TestSyncSkills:
         assert "new-skill" in result["copied"]
         assert "old-skill" not in result["copied"]
         assert "old-skill" not in result.get("updated", [])
-        assert not (skills_dir / "old-skill").exists()
+        assert "old-skill" in result["restored"]
+        assert (skills_dir / "old-skill" / "SKILL.md").exists()
         assert "removed-skill" in result["cleaned"]
         assert "removed-skill" not in manifest
 
