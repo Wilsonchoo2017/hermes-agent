@@ -192,7 +192,7 @@ The curator only manages skills explicitly marked as **agent-created** in
 `~/.hermes/skills/.usage.json`. A skill qualifies when ALL of the following
 are true:
 
-1. Its name is **not** in `~/.hermes/skills/.bundled_manifest` (bundled skills shipped with the repo).
+1. Its name is **not** in `~/.hermes/.bundled_manifest` (bundled skills shipped with the repo).
 2. Its name is **not** in `~/.hermes/skills/.hub/lock.json` (hub-installed skills).
 3. Its `.usage.json` entry has `"created_by": "agent"` or `"agent_created": true`.
 

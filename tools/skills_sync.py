@@ -16,10 +16,14 @@ Update logic:
         the user copy.
       * If bundled changed and user copy matches origin hash: safe to update.
       * If bundled changed and user copy differs: user customized it → SKIP.
-  - DELETED by user (in manifest, absent from user dir): respected, not re-added.
+  - MISSING from disk (in manifest, absent from user dir): restored. Only
+    the curator suppression list marks a removal as deliberate.
   - REMOVED from bundled (in manifest, gone from repo): cleaned from manifest.
 
-The manifest lives at ~/.hermes/skills/.bundled_manifest.
+The manifest lives at ~/.hermes/.bundled_manifest -- deliberately OUTSIDE
+skills/, see the note on MANIFEST_FILE below. Older installs keep it at
+~/.hermes/skills/.bundled_manifest; that location is read as a fallback and
+migrated on the next sync.
 """
 
 import hashlib
@@ -55,7 +59,30 @@ logger = logging.getLogger(__name__)
 
 HERMES_HOME = get_hermes_home()
 SKILLS_DIR = HERMES_HOME / "skills"
-MANIFEST_FILE = SKILLS_DIR / ".bundled_manifest"
+
+# The manifest sits NEXT TO skills/, never inside it.
+#
+# It used to live at ``skills/.bundled_manifest``, which put the record of
+# "what should be installed" inside the very tree it describes. Every
+# operation that copies a skills tree — most importantly ``hermes profile
+# create --clone``, which copytrees ``skills/`` wholesale — therefore carried
+# the inventory along with the payload. When the payload arrived incomplete,
+# the inventory still claimed everything was present, and the profile was born
+# describing files it did not have. Since a tracked-but-absent skill is now
+# restored on sync (#16) that no longer strands the skill, but the profile
+# still starts with an inventory it never earned: origin hashes attributed to
+# a copy it never made, so a later upstream change cannot tell "user edited
+# this" from "this arrived from somewhere else".
+#
+# Keeping the manifest outside skills/ makes a clone inherit the tree and
+# nothing else. The new profile has no manifest, so the first sync baselines
+# every skill against what is actually on disk.
+MANIFEST_FILE = HERMES_HOME / ".bundled_manifest"
+
+# Shared by the canonical location and the pre-relocation one inside
+# skills/, which is still read (and migrated away from) for installs that
+# predate the move.
+MANIFEST_FILENAME = ".bundled_manifest"
 
 # Import-time snapshots backing the call-time accessors below. Same bug class
 # and same fix as skills_tool (f8723c478) and skill_manager_tool (c6a3d412d):
@@ -93,7 +120,51 @@ def _manifest_file() -> Path:
     configured = Path(MANIFEST_FILE)
     if configured != _MANIFEST_FILE_AT_IMPORT:
         return configured
-    return _skills_dir() / ".bundled_manifest"
+    return _hermes_home() / MANIFEST_FILENAME
+
+
+def _legacy_manifest_file() -> Path:
+    """Pre-relocation manifest path (inside ``skills/``)."""
+    return _skills_dir() / MANIFEST_FILENAME
+
+
+def _migrate_legacy_manifest(quiet: bool = True) -> bool:
+    """Move a pre-relocation manifest out of ``skills/``. Returns True if moved.
+
+    Also removes a legacy file that has already been superseded by a canonical
+    one: leaving it in ``skills/`` would let the next profile clone copy a
+    stale inventory back out of the tree, which is the whole failure this
+    relocation exists to prevent.
+    """
+    canonical = _manifest_file()
+    legacy = _legacy_manifest_file()
+    if canonical == legacy or not legacy.is_file():
+        return False
+
+    if canonical.exists():
+        try:
+            legacy.unlink()
+            logger.info("Removed superseded legacy skills manifest %s", legacy)
+        except OSError:
+            logger.debug("Could not remove legacy manifest %s", legacy, exc_info=True)
+        return False
+
+    try:
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(
+            canonical,
+            legacy.read_text(encoding="utf-8"),
+            tmp_prefix=".bundled_manifest_",
+            preserve_mode=True,
+        )
+        legacy.unlink()
+    except Exception as e:
+        logger.debug("Could not migrate legacy manifest %s: %s", legacy, e, exc_info=True)
+        return False
+
+    if not quiet:
+        print(f"  ⇪ moved skills manifest out of skills/ ({legacy} -> {canonical})")
+    return True
 
 # Marker file written by `hermes profile create --no-skills` (named profiles)
 # and by the installer's `--no-skills` flag (the default ~/.hermes profile).
@@ -164,11 +235,18 @@ def _read_manifest() -> Dict[str, str]:
     Handles both v1 (plain names) and v2 (name:hash) formats.
     v1 entries get an empty hash string which triggers migration on next sync.
     """
-    if not _manifest_file().exists():
-        return {}
+    path = _manifest_file()
+    if not path.exists():
+        # Pre-relocation install whose sync has not run yet. Read through to
+        # the old location so read-only callers see the right data before
+        # sync_skills() migrates the file.
+        legacy = _legacy_manifest_file()
+        if legacy == path or not legacy.is_file():
+            return {}
+        path = legacy
     try:
         result = {}
-        for line in _manifest_file().read_text(encoding="utf-8").splitlines():
+        for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -741,6 +819,9 @@ def sync_skills(quiet: bool = False) -> dict:
         }
 
     _skills_dir().mkdir(parents=True, exist_ok=True)
+    # Relocate a pre-move manifest before reading it, so this run writes to
+    # (and everything after reads from) the canonical location outside skills/.
+    _migrate_legacy_manifest(quiet=quiet)
     manifest = _read_manifest()
     bundled_skills = _discover_bundled_skills(bundled_dir)
     if essential_only:

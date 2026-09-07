@@ -421,6 +421,94 @@ def _read_manifest_at(manifest_file):
     }
 
 
+class TestManifestRelocation:
+    """The manifest lives next to skills/, never inside it.
+
+    Inside the tree, every operation that copies ``skills/`` copied the
+    inventory too — most importantly ``hermes profile create --clone``, which
+    copytrees the whole directory. A clone then started life claiming origin
+    hashes for a copy it never made.
+    """
+
+    def _bundled(self, tmp_path):
+        bundled = tmp_path / "bundled"
+        (bundled / "category" / "alpha").mkdir(parents=True)
+        (bundled / "category" / "alpha" / "SKILL.md").write_text("# Alpha")
+        return bundled
+
+    def test_manifest_is_written_outside_the_skills_tree(self, tmp_path):
+        import tools.skills_sync as ss
+
+        bundled = self._bundled(tmp_path)
+        home = tmp_path / "home"
+        home.mkdir()
+
+        with patch("tools.skills_sync._get_bundled_dir", return_value=bundled), \
+             patch("tools.skills_sync._get_optional_dir",
+                   return_value=bundled.parent / "optional-skills"), \
+             patch("tools.skills_sync.HERMES_HOME", home):
+            sync_skills(quiet=True)
+
+        assert (home / ".bundled_manifest").is_file()
+        assert not (home / "skills" / ".bundled_manifest").exists()
+        # A clone copies skills/ — and now picks up no inventory with it.
+        assert (home / "skills" / "category" / "alpha" / "SKILL.md").exists()
+
+    def test_legacy_manifest_is_read_then_migrated(self, tmp_path):
+        """A pre-move install keeps its history: same entries, new location."""
+        import tools.skills_sync as ss
+
+        bundled = self._bundled(tmp_path)
+        home = tmp_path / "home"
+        legacy = home / "skills" / ".bundled_manifest"
+        legacy.parent.mkdir(parents=True)
+        alpha_hash = _dir_hash(bundled / "category" / "alpha")
+        legacy.write_text(f"alpha:{alpha_hash}\n")
+        # The skill it tracks is genuinely on disk, so this is a plain
+        # relocation and not a restore.
+        shutil_copytree_dest = home / "skills" / "category" / "alpha"
+        shutil_copytree_dest.mkdir(parents=True)
+        (shutil_copytree_dest / "SKILL.md").write_text("# Alpha")
+
+        with patch("tools.skills_sync._get_bundled_dir", return_value=bundled), \
+             patch("tools.skills_sync._get_optional_dir",
+                   return_value=bundled.parent / "optional-skills"), \
+             patch("tools.skills_sync.HERMES_HOME", home):
+            # Read-only callers see the legacy data before any sync runs.
+            assert set(ss._read_manifest()) == {"alpha"}
+            sync_skills(quiet=True)
+            migrated = ss._read_manifest()
+
+        assert migrated["alpha"] == alpha_hash
+        assert (home / ".bundled_manifest").is_file()
+        assert not legacy.exists(), "legacy manifest must not be left in skills/"
+
+    def test_superseded_legacy_manifest_is_removed(self, tmp_path):
+        """A stale copy inside skills/ is deleted even when a canonical exists.
+
+        Left in place it would be copied back out by the next clone — exactly
+        the resurrection this relocation exists to prevent.
+        """
+        import tools.skills_sync as ss
+
+        bundled = self._bundled(tmp_path)
+        home = tmp_path / "home"
+        (home / "skills").mkdir(parents=True)
+        (home / ".bundled_manifest").write_text("alpha:canonical\n")
+        legacy = home / "skills" / ".bundled_manifest"
+        legacy.write_text("alpha:stale\nghost:stale\n")
+
+        with patch("tools.skills_sync._get_bundled_dir", return_value=bundled), \
+             patch("tools.skills_sync._get_optional_dir",
+                   return_value=bundled.parent / "optional-skills"), \
+             patch("tools.skills_sync.HERMES_HOME", home):
+            ss._migrate_legacy_manifest()
+            surviving = ss._read_manifest()
+
+        assert not legacy.exists()
+        assert "ghost" not in surviving, "the stale copy must not win"
+
+
 class TestSyncSkills:
     def _setup_bundled(self, tmp_path):
         """Create a fake bundled skills directory."""
@@ -1042,7 +1130,13 @@ class TestCallTimeDirResolution:
         try:
             assert ss._hermes_home() == profile_home
             assert ss._skills_dir() == profile_home / "skills"
-            assert ss._manifest_file() == profile_home / "skills" / ".bundled_manifest"
+            # The manifest hangs off HERMES_HOME, not skills/ — see the note
+            # on MANIFEST_FILE for why it must not live inside the tree it
+            # describes.
+            assert ss._manifest_file() == profile_home / ".bundled_manifest"
+            assert ss._legacy_manifest_file() == (
+                profile_home / "skills" / ".bundled_manifest"
+            )
         finally:
             reset_hermes_home_override(token)
 
@@ -1055,8 +1149,15 @@ class TestCallTimeDirResolution:
         try:
             with patch("tools.skills_sync.SKILLS_DIR", patched):
                 assert ss._skills_dir() == patched
-                # MANIFEST_FILE unpatched -> derives from the patched skills dir.
-                assert ss._manifest_file() == patched / ".bundled_manifest"
+                # MANIFEST_FILE unpatched -> derives from HERMES_HOME, NOT
+                # from the patched skills dir. The two are independent now:
+                # moving the skills tree no longer moves the manifest with it.
+                assert ss._manifest_file() == (
+                    tmp_path / "other-profile" / ".bundled_manifest"
+                )
+                # The legacy path still tracks the skills dir, so a pre-move
+                # manifest is found wherever that tree is pointed.
+                assert ss._legacy_manifest_file() == patched / ".bundled_manifest"
         finally:
             reset_hermes_home_override(token)
 
