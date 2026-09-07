@@ -180,10 +180,14 @@ def activity_count(record: Dict[str, Any]) -> int:
 def _read_bundled_manifest_names() -> Set[str]:
     """Return the set of skill names that were seeded from the bundled repo.
 
-    Reads ~/.hermes/skills/.bundled_manifest (format: "name:hash" per line).
-    Returns empty set if the file is missing or unreadable.
+    Reads ~/.hermes/.bundled_manifest (format: "name:hash" per line), falling
+    back to the pre-relocation path inside skills/ on installs whose first
+    post-move sync has not run yet. Returns empty set if neither exists or the
+    file is unreadable.
     """
-    manifest = _skills_dir() / ".bundled_manifest"
+    manifest = get_hermes_home() / ".bundled_manifest"
+    if not manifest.exists():
+        manifest = _skills_dir() / ".bundled_manifest"
     if not manifest.exists():
         return set()
     names: Set[str] = set()

@@ -108,6 +108,11 @@ USER_OWNED_EXCLUDE: frozenset = frozenset({
     "gateway.pid", "gateway_state.json", "processes.json",
     "auth.lock", "active_profile", ".update_check",
     "errors.log", ".hermes_history",
+    # Bundled-skill inventory. Local to this install: its origin hashes
+    # describe copies THIS machine made. Shipping one would hand the target
+    # a record of a sync it never ran — the same "inventory without the
+    # payload" mismatch that moving it out of skills/ exists to prevent.
+    ".bundled_manifest",
     # User data
     "memories", "sessions", "logs", "plans", "workspace", "home",
     "image_cache", "audio_cache", "document_cache",

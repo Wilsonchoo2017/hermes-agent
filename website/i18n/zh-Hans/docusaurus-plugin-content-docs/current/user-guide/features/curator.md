@@ -132,7 +132,7 @@ curator:
 
 若技能名称**不在**以下列表中，则视为 agent 创建：
 
-- `~/.hermes/skills/.bundled_manifest`（安装时从仓库复制的技能），以及
+- `~/.hermes/.bundled_manifest`（安装时从仓库复制的技能），以及
 - `~/.hermes/skills/.hub/lock.json`（通过 `hermes skills install` 安装的技能）。
 
 `~/.hermes/skills/` 中的其他所有内容均在 curator 的处理范围内，包括：

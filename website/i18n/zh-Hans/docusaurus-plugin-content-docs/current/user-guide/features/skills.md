@@ -212,12 +212,15 @@ metadata:
 │   └── deploy-k8s/                # Agent-created skill
 │       ├── SKILL.md
 │       └── references/
-├── .hub/                          # Skills Hub state
-│   ├── lock.json
-│   ├── quarantine/
-│   └── audit.log
-└── .bundled_manifest              # Tracks seeded bundled skills
+└── .hub/                          # Skills Hub state
+    ├── lock.json
+    ├── quarantine/
+    └── audit.log
 ```
+
+The bundled-skill manifest is **not** in here — it lives at
+`~/.hermes/.bundled_manifest`, one level up, so that copying a skills tree
+does not copy the record of what that tree is supposed to contain.
 
 通过第三方 URL 或 GitHub 安装时，Hermes 会安装 `SKILL.md`，以及其中明确引用且位于 `references/`、`templates/`、`scripts/`、`assets/` 和 `examples/` 下的文件。未引用的仓库文件不会被复制。Hermes 会扫描完整的隔离捆绑包，并在 `skills/.hub/lock.json` 中记录来源 URL、精确内容哈希、扫描器版本、发现项、时间戳，以及本次结果是新扫描还是缓存复用。
 
@@ -706,7 +709,7 @@ Tap 存储在 `~/.hermes/.hub/taps.json` 中（按需创建）。
 
 ## 捆绑 skill 更新（`hermes skills reset`）
 
-Hermes 在仓库的 `skills/` 中附带一组捆绑 skills。在安装时以及每次 `hermes update` 时，同步过程会将这些 skills 复制到 `~/.hermes/skills/` 中，并在 `~/.hermes/skills/.bundled_manifest` 记录一个清单，将每个 skill 名称映射到同步时的内容哈希（**origin hash**）。
+Hermes 在仓库的 `skills/` 中附带一组捆绑 skills。在安装时以及每次 `hermes update` 时，同步过程会将这些 skills 复制到 `~/.hermes/skills/` 中，并在 `~/.hermes/.bundled_manifest` 记录一个清单，将每个 skill 名称映射到同步时的内容哈希（**origin hash**）。
 
 每次同步时，Hermes 重新计算本地副本的哈希并与 origin hash 比较：
 

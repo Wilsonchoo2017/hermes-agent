@@ -317,12 +317,15 @@ See [Skill Settings](/user-guide/configuration#skill-settings) and [Creating Ski
 │   └── deploy-k8s/                # Agent-created skill
 │       ├── SKILL.md
 │       └── references/
-├── .hub/                          # Skills Hub state
-│   ├── lock.json
-│   ├── quarantine/
-│   └── audit.log
-└── .bundled_manifest              # Tracks seeded bundled skills
+└── .hub/                          # Skills Hub state
+    ├── lock.json
+    ├── quarantine/
+    └── audit.log
 ```
+
+The bundled-skill manifest is **not** in here — it lives at
+`~/.hermes/.bundled_manifest`, one level up, so that copying a skills tree
+does not copy the record of what that tree is supposed to contain.
 
 Third-party URL and GitHub installs include `SKILL.md` plus the exact local
 files it references under `references/`, `templates/`, `scripts/`, `assets/`,
@@ -983,7 +986,9 @@ Taps are stored in `~/.hermes/skills/.hub/taps.json` (created on demand).
 
 ## Bundled skill updates (`hermes skills reset`)
 
-Hermes ships with a set of bundled skills in `skills/` inside the repo. On install and on every `hermes update`, a sync pass copies those into `~/.hermes/skills/` and records a manifest at `~/.hermes/skills/.bundled_manifest` mapping each skill name to the content hash at the time it was synced (the **origin hash**).
+Hermes ships with a set of bundled skills in `skills/` inside the repo. On install and on every `hermes update`, a sync pass copies those into `~/.hermes/skills/` and records a manifest at `~/.hermes/.bundled_manifest` mapping each skill name to the content hash at the time it was synced (the **origin hash**).
+
+The manifest sits *next to* `skills/`, not inside it. Anything that copies a skills tree — `hermes profile create --clone` most of all — would otherwise carry the inventory along with the payload, and a clone would start life claiming origin hashes for a copy it never made. Installs that predate this keep their manifest at `~/.hermes/skills/.bundled_manifest`; it is read as a fallback and moved on the next sync.
 
 On each sync, Hermes recomputes the hash of your local copy and compares it to the origin hash:
 
