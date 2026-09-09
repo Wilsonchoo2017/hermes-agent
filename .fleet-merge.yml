@@ -1,0 +1,18 @@
+# What the fleet may merge into this repo without a human.
+# See fleetctl docs/superpowers/specs/2026-08-29-agent-merge-design.md.
+#
+# This file holds itself: widening the list is a PR that touches a held path,
+# so the gate can never be loosened by the thing the gate governs.
+max_diff_lines: 400
+hold:
+
+  - ".fleet-merge.yml"
+  - ".github/**"
+  - "**/*secret*"
+  - "pyproject.toml"
+  - "uv.lock"
+  - "setup.py"
+  - "package.json"
+  - "package-lock.json"
+  - "scripts/**"
+  - "docker/**"
