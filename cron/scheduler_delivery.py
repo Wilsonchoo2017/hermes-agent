@@ -1450,9 +1450,11 @@ def _standalone_send(
     shutdown_msg = f"delivery to {t.where} skipped — interpreter is shutting down"
 
     def _send():
+        task_name = job.get("name", job.get("id", "cron task"))
         return _send_to_platform(
             t.platform, t.pconfig, t.chat_id, content, thread_id=t.thread_id,
-            media_files=media_files)
+            media_files=media_files, title=task_name, priority=job.get("_delivery_priority"),
+        )
 
     def _warned(msg: str) -> tuple[None, str]:
         logger.warning("Job '%s': %s", job["id"], msg)
@@ -1661,12 +1663,18 @@ def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
 
 
 def _deliver_result(
-    job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False
+    job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False, priority: object = None
 ) -> Optional[str]:
     """Deliver job output to the configured target(s). With ``adapters``/``loop`` (gateway
     running) the live adapter is tried first (E2EE rooms can't use the standalone HTTP path), then
     standalone fallback. ``for_failure=True`` routes failure-category notices through the job's
-    ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
+    ``failure_deliver`` override when present (NS-788). ``priority`` (ntfy X-Priority, 1..5) is
+    threaded into delivery metadata / standalone sends when provided; platforms that don't surface
+    priority ignore it. Returns None on success, else an error."""
+    # Expose the explicit priority (e.g. urgent for failures) to the standalone
+    # delivery lane via the job; platforms that surface priority read it here.
+    if priority is not None:
+        job["_delivery_priority"] = priority
     job.pop("_bot_chat_delivery_receipts", None)
     targets = _resolve_delivery_targets(job, for_failure=for_failure)
     if not targets:
@@ -1704,8 +1712,11 @@ def _deliver_result(
     # Targets acked with NO evidence (bare SendResult(success=True) — Slack/Matrix/Mattermost);
     # persisted as ``last_delivery_unverified`` so `hermes cron list` shows it.
     unverified_targets: list = []
+    # The task name doubles as the notification title on platforms that surface
+    # one (e.g. ntfy's X-Title). Compute it once, before the wrap block, so it
+    # is available whether or not wrapping is enabled.
+    task_name = job.get("name", job.get("id", "cron task"))
     if wrap_response:
-        task_name = job.get("name", job["id"])
         delivery_content = (
             f"Cronjob Response: {task_name}\n"
             f"(job_id: {job.get('id', '')})\n"

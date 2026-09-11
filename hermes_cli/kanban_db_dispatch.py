@@ -133,6 +133,13 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    spawn_gated: Optional[str] = None
+    """When a ``kanban.spawn_gate`` script is configured and returned PAUSE
+    (non-zero exit) this tick, the message from the gate. ``None`` when no
+    gate is configured or the gate allowed spawning. When set, no ready or
+    review workers were spawned this tick — the gate is re-checked on the
+    next tick, so tasks stay in ``ready`` and spawn automatically once the
+    gate clears (no manual unblock needed)."""
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -994,6 +1001,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    summary: Optional[str] = None,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
     non-success path funnels through here so ``consecutive_failures`` stays
@@ -1006,6 +1014,12 @@ def _record_task_failure(
     ``blocked`` + ``gave_up``). Threshold: per-task ``max_retries`` >
     ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``. ``force_trip`` trips
     unconditionally (caller applied its own bounded-retry policy).
+
+    ``summary`` is the dying attempt's own account of what it did, persisted
+    to ``task_runs.summary`` so a later ``build_worker_context`` can hand it
+    to the next attempt. Optional: most failure paths (crash, spawn failure)
+    have no worker left to ask. Not capped here — the read path caps at
+    ``_CTX_MAX_FIELD_BYTES``.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -1051,6 +1065,7 @@ def _record_task_failure(
             if end_run:
                 run_id = _kb._end_run(
                     conn, task_id, outcome=outcome, status=outcome, error=error,
+                    summary=summary,
                     metadata={"failures": failures, "retry_status": retry_status},
                 )
                 _kb._append_event(
@@ -1083,6 +1098,7 @@ def _record_task_failure(
             # Only the spawn path has an open run to close.
             run_id = _kb._end_run(
                 conn, task_id, outcome="gave_up", status="gave_up", error=error,
+                summary=summary,
                 metadata={
                     "failures": failures,
                     "trigger_outcome": outcome,
@@ -1105,6 +1121,77 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
         if run_id is not None:
             conn.execute("UPDATE task_runs SET worker_pid = ? WHERE id = ?", (int(pid), run_id))
         _kb._append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+
+
+def _spawn_gate_verdict(board: Optional[str] = None) -> Optional[str]:
+    """Run the configured ``kanban.spawn_gate`` script and return a PAUSE
+    message, or ``None`` when spawning is allowed.
+
+    The gate is a pre-spawn guard: when configured, the dispatcher runs it
+    once per tick BEFORE claiming/spawning any ready or review worker. A
+    non-zero exit (PAUSE) defers all spawns this tick — tasks stay in
+    ``ready`` and are re-checked on the next tick, so they auto-resume the
+    moment the gate clears, with zero worker boots wasted on a PAUSE.
+
+    The gate command is resolved per-board so unrelated boards are never
+    gated by another board's policy:
+
+      1. ``board.json`` ``spawn_gate`` field (per-board, highest precedence)
+      2. global ``kanban.spawn_gate`` config (fallback)
+
+    The value is an absolute path to an executable script (or a command
+    line, split on whitespace). The script is expected to print a human
+    message and exit 0 (RUN) or non-zero (PAUSE). Exit code 2 (UNKNOWN) is
+    treated as PAUSE (fail closed).
+
+    Returns ``None`` when no gate is configured, the script is missing, or
+    the script exits 0. Returns the script's stdout (trimmed) when it
+    exits non-zero. Any error running the script (missing file, non-
+    executable, exception) fails closed to PAUSE with a diagnostic message
+    so a broken gate never silently lets work through.
+    """
+    raw = None
+    # Per-board gate (board.json) wins over the global config fallback.
+    try:
+        raw = _kb.read_board_metadata(board).get("spawn_gate")
+    except Exception:
+        raw = None
+    if not raw:
+        try:
+            from hermes_cli.config import load_config_readonly
+            raw = (load_config_readonly() or {}).get("kanban", {}).get("spawn_gate")
+        except Exception:
+            raw = None
+    if not raw:
+        return None
+    cmd = str(raw).strip()
+    if not cmd:
+        return None
+    # Split a command line on whitespace (shlex) so a gate can carry args.
+    import shlex
+    try:
+        argv = shlex.split(cmd)
+    except ValueError:
+        argv = [cmd]
+    if not argv:
+        return None
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except FileNotFoundError:
+        return f"spawn_gate: script not found: {argv[0]}"
+    except subprocess.TimeoutExpired:
+        return f"spawn_gate: timed out: {argv[0]}"
+    except Exception as exc:  # noqa: BLE001 - fail closed on any gate error
+        return f"spawn_gate: error running {argv[0]}: {exc}"
+    if proc.returncode == 0:
+        return None
+    msg = (proc.stdout or proc.stderr or "").strip()
+    return msg or f"spawn_gate: exit {proc.returncode}"
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -1228,7 +1315,7 @@ def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
 
 def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL",
         (status,),
     ).fetchall()
@@ -1238,7 +1325,17 @@ def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
     if profile_exists is None:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
-    return any(profile_exists(row["assignee"]) for row in rows)
+    for row in rows:
+        if not profile_exists(row["assignee"]):
+            continue
+        # A guard-held task is deferred this tick, not spawnable (an active PR,
+        # recent success, rate-limit cooldown or blocker_auth holds it). Counting
+        # it as "spawnable" would make the health alarm fire a false "stuck" that
+        # never clears while a PR-guarded worker waits on its PR.
+        if check_respawn_guard(conn, row["id"], lane=status) is not None:
+            continue
+        return True
+    return False
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
@@ -1776,6 +1873,19 @@ def _dispatch_once_locked(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
     if not may_spawn:
+        return result
+
+    # Pre-spawn gate (kanban.spawn_gate): when configured, run it once per
+    # tick BEFORE claiming/spawning any worker. A PAUSE (non-zero exit)
+    # defers ALL spawns this tick — tasks stay in ``ready`` and are
+    # re-checked on the next tick, so they auto-resume the moment the gate
+    # clears with zero worker boots wasted. This is the root-cause fix for
+    # the pace-gate re-block loop: previously the gate ran inside the
+    # worker AFTER spawn, so every PAUSE burned a full worker boot.
+    spawn_gate_msg = _spawn_gate_verdict(board=board)
+    if spawn_gate_msg is not None:
+        result.spawn_gated = spawn_gate_msg
+        _kb._log.info("kanban dispatch: spawn gate PAUSE — %s", spawn_gate_msg)
         return result
 
     ready_rows = _lane_rows(conn, "ready")
