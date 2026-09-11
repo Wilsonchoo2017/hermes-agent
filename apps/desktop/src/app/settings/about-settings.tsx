@@ -72,7 +72,7 @@ export function AboutSettings() {
 
   const handleCheck = async () => {
     setJustChecked(false)
-    const next = await checkUpdates({ force: true })
+    const next = await checkUpdates()
     setJustChecked(Boolean(next))
   }
 
