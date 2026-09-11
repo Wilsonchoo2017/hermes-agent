@@ -1052,6 +1052,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_repair.add_argument("--json", action="store_true",
                           help="Emit the repair report as JSON")
 
+    # --- pause / resume (kanban-scoped) ---
+    p_pause = sub.add_parser(
+        "pause",
+        help="Kanban-only pause: halt new worker spawns (chat and cron keep running)",
+    )
+    p_pause.add_argument(
+        "--reason", default=None,
+        help="Optional reason stored in the sentinel and shown to users",
+    )
+    sub.add_parser("resume", help="Lift the kanban-only pause set by `hermes kanban pause`")
+
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
@@ -1087,6 +1098,14 @@ def kanban_command(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+
+    # pause/resume manage the kanban-scoped pause sentinel (ESTOP_KANBAN), not the board
+    # DB — handle them before any --board routing or DB init so they work even when no
+    # board exists or the DB is corrupt.
+    if action == "pause":
+        return _cmd_kanban_pause(args)
+    if action == "resume":
+        return _cmd_kanban_resume(args)
 
     # Board-management commands operate on board metadata and the persisted
     # current-board pointer itself. They must ignore the shared `--board`
@@ -3388,6 +3407,59 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_kanban_pause(args: argparse.Namespace) -> int:
+    """Engage the kanban-only pause (`hermes kanban pause`): stop NEW worker spawns only."""
+    from agent import estop
+
+    reason = getattr(args, "reason", None)
+    already = estop.is_kanban_engaged()
+    path = estop.kanban_engage(reason=reason)
+    state = estop.get_kanban_state() or {}
+    verb = "Kanban already paused" if already else "Kanban paused"
+    detail = f" — reason: {state['reason']}" if state.get("reason") else ""
+    print(f"⏸️  {verb}{detail}")
+    print(f"    sentinel: {path}")
+    print(
+        "    New Kanban worker spawns are on hold; chat turns and cron dispatch "
+        "keep running.\n"
+        "    In-flight workers keep running. Run `hermes kanban resume` to lift the pause.")
+    return 0
+
+
+def _cmd_kanban_resume(args: argparse.Namespace) -> int:
+    """Disengage the kanban-only pause (`hermes kanban resume`)."""
+    from agent import estop
+
+    if estop.kanban_disengage():
+        print("▶️  Kanban resumed — new worker spawns pick up on the next dispatch tick.")
+    else:
+        print(f"Kanban is not paused (no sentinel at {estop.kanban_sentinel_path()}).")
+    return 0
+
+
+_HANDLERS = {
+    "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
+    "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
+    "assign": _cmd_assign, "set-model": _cmd_set_model,
+    "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
+    "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
+    "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,
+    "comment": _cmd_comment, "attach": _cmd_attach,
+    "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
+    "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
+    "schedule": _cmd_schedule, "unblock": _cmd_unblock,
+    "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
+    "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
+    "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
+    "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
+    "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
+    "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
+    "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
+    "context": _cmd_context, "specify": _cmd_specify, "decompose": _cmd_decompose,
+    "gc": _cmd_gc, "pause": _cmd_kanban_pause, "resume": _cmd_kanban_resume,
+}
+
+
 def _cmd_repair(args: argparse.Namespace) -> int:
     """Check DB integrity and apply the narrow index-REINDEX auto-repair.
 
@@ -3481,6 +3553,8 @@ Common subcommands:
   `context <id>`        Full worker-context dump
   `runs <id>`           Attempt history
   `log <id>`            Worker log
+  `pause [reason]`      Kanban-only pause (halt new spawns; chat/cron keep running)
+  `resume`              Lift the kanban-only pause
 
 Run `/kanban <subcommand> -h` for arguments. \
 Read-only commands are safe while an agent is running.\
