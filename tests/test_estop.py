@@ -98,7 +98,7 @@ def test_check_paused_logs_once_per_engagement(hermes_home, caplog):
     assert len(paused_logs) == 1
 
 
-# ── cron scheduler is unaffected by the Kanban pause ────────────────────────
+# ── cron scheduler is unaffected by the Kanban-only pause ──────────────────
 
 
 def test_cron_tick_dispatches_while_engaged(hermes_home, monkeypatch):
@@ -112,9 +112,30 @@ def test_cron_tick_dispatches_while_engaged(hermes_home, monkeypatch):
 
     monkeypatch.setattr(scheduler, "get_due_jobs", _fake_get_due_jobs)
 
-    estop.engage(reason="test")
+    # The kanban-scoped pause (`hermes kanban pause`) must NOT gate cron dispatch.
+    estop.kanban_engage(reason="test")
     scheduler.tick(verbose=False)
-    assert calls == [1], "the Kanban pause must not gate cron dispatch"
+    assert calls == [1], "the Kanban-only pause must not gate cron dispatch"
+    assert estop.is_kanban_engaged() is True
+    assert estop.is_engaged() is False, "kanban-only pause must not engage the global STOP ALL"
+
+
+def test_global_pause_gates_cron(hermes_home, monkeypatch):
+    """The global `hermes pause` (ESTOP) still halts cron dispatch — STOP ALL semantics."""
+    from cron import scheduler
+
+    calls = []
+
+    def _fake_get_due_jobs():
+        calls.append(1)
+        return []
+
+    monkeypatch.setattr(scheduler, "get_due_jobs", _fake_get_due_jobs)
+
+    estop.engage(reason="global")
+    scheduler.tick(verbose=False)
+    assert calls == [], "the global emergency stop must gate cron dispatch"
+    assert estop.is_engaged() is True
 
 
 # ── kanban dispatcher integration ───────────────────────────────────────────
@@ -127,6 +148,18 @@ def test_kanban_dispatch_blocked_when_engaged(hermes_home):
     estop.engage(reason="test")
     assert _kanban_dispatch_allowed() is False
     estop.disengage()
+    assert _kanban_dispatch_allowed() is True
+
+
+def test_kanban_dispatch_blocked_by_kanban_only_pause(hermes_home):
+    """`hermes kanban pause` gates the dispatcher, while chat/cron stay up."""
+    from gateway.kanban_watchers_common import _kanban_dispatch_allowed
+
+    assert _kanban_dispatch_allowed() is True
+    estop.kanban_engage(reason="fleet freeze")
+    assert _kanban_dispatch_allowed() is False
+    assert estop.is_engaged() is False, "kanban-only pause must leave the global stop untouched"
+    estop.kanban_disengage()
     assert _kanban_dispatch_allowed() is True
 
 
