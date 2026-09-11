@@ -12,6 +12,8 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -34,11 +36,11 @@ def _last_run_summary(conn, task_id: str) -> str | None:
 
 
 def test_summary_is_persisted_on_the_normal_failure_branch(kanban_home: Path) -> None:
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="budget death")
         kb.claim_task(conn, tid)
 
-        kb._record_task_failure(
+        kbd._record_task_failure(
             conn,
             tid,
             error="Iteration budget exhausted (150/150)",
@@ -55,11 +57,11 @@ def test_summary_is_persisted_on_the_normal_failure_branch(kanban_home: Path) ->
 
 def test_summary_is_persisted_when_the_breaker_trips(kanban_home: Path) -> None:
     # failure_limit=1 forces the ``gave_up`` branch on the first failure.
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="budget death, breaker trips")
         kb.claim_task(conn, tid)
 
-        kb._record_task_failure(
+        kbd._record_task_failure(
             conn,
             tid,
             error="Iteration budget exhausted (150/150)",
@@ -81,12 +83,12 @@ def test_a_summary_dropped_by_the_cas_is_logged(kanban_home, monkeypatch, caplog
 
     monkeypatch.setattr(kb, "_end_run", lambda *a, **kw: None)
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="cas loser")
         kb.claim_task(conn, tid)
 
         with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_db"):
-            kb._record_task_failure(
+            kbd._record_task_failure(
                 conn,
                 tid,
                 error="Iteration budget exhausted (150/150)",
@@ -107,12 +109,12 @@ def test_no_warning_when_there_was_no_summary_to_drop(kanban_home, monkeypatch, 
 
     monkeypatch.setattr(kb, "_end_run", lambda *a, **kw: None)
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="no run, no summary")
         kb.claim_task(conn, tid)
 
         with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_db"):
-            kb._record_task_failure(
+            kbd._record_task_failure(
                 conn,
                 tid,
                 error="pid 4242 not alive",
@@ -126,11 +128,11 @@ def test_no_warning_when_there_was_no_summary_to_drop(kanban_home, monkeypatch, 
 
 def test_omitting_the_summary_still_works(kanban_home: Path) -> None:
     """The parameter is optional: every existing caller passes nothing."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="no summary available")
         kb.claim_task(conn, tid)
 
-        kb._record_task_failure(
+        kbd._record_task_failure(
             conn,
             tid,
             error="pid 4242 not alive",
