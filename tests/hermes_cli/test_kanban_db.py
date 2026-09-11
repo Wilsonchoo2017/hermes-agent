@@ -459,9 +459,9 @@ def test_dispatch_spawn_gate_pause_defers_all_spawns(
         spawns.append(task.id)
         return 42
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="gated", assignee="alice")
-        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
         task = kb.get_task(conn, tid)
 
     assert not res.spawned
@@ -487,9 +487,9 @@ def test_dispatch_spawn_gate_run_allows_spawn(
         spawns.append(task.id)
         return 42
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="ungated", assignee="alice")
-        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
 
     assert res.spawned
     assert spawns == [tid]
