@@ -152,6 +152,14 @@ def kanban_command(args: argparse.Namespace) -> int:
     if _is_delegated_child_cli_mutation(args):
         return _err("kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI")
 
+    # pause/resume manage the kanban-scoped pause sentinel (ESTOP_KANBAN), not the board
+    # DB — handle them before any --board routing or DB init so they work even when no
+    # board exists or the DB is corrupt.
+    if action == "pause":
+        return _cmd_kanban_pause(args)
+    if action == "resume":
+        return _cmd_kanban_resume(args)
+
     # `boards …` manages board metadata and the current-board pointer itself, so it must ignore
     # the `--board` routing override (else `--board beta boards show` reports beta).
     if action == "boards":
@@ -1229,6 +1237,36 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
                              ("task_id", "ok", "reason", "fanout", "child_ids", "new_title"), _decompose_ok_line)
 
 
+def _cmd_kanban_pause(args: argparse.Namespace) -> int:
+    """Engage the kanban-only pause (`hermes kanban pause`): stop NEW worker spawns only."""
+    from agent import estop
+
+    reason = getattr(args, "reason", None)
+    already = estop.is_kanban_engaged()
+    path = estop.kanban_engage(reason=reason)
+    state = estop.get_kanban_state() or {}
+    verb = "Kanban already paused" if already else "Kanban paused"
+    detail = f" — reason: {state['reason']}" if state.get("reason") else ""
+    print(f"⏸️  {verb}{detail}")
+    print(f"    sentinel: {path}")
+    print(
+        "    New Kanban worker spawns are on hold; chat turns and cron dispatch "
+        "keep running.\n"
+        "    In-flight workers keep running. Run `hermes kanban resume` to lift the pause.")
+    return 0
+
+
+def _cmd_kanban_resume(args: argparse.Namespace) -> int:
+    """Disengage the kanban-only pause (`hermes kanban resume`)."""
+    from agent import estop
+
+    if estop.kanban_disengage():
+        print("▶️  Kanban resumed — new worker spawns pick up on the next dispatch tick.")
+    else:
+        print(f"Kanban is not paused (no sentinel at {estop.kanban_sentinel_path()}).")
+    return 0
+
+
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
@@ -1248,7 +1286,7 @@ _HANDLERS = {
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
     "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
     "context": _cmd_context, "specify": _cmd_specify, "decompose": _cmd_decompose,
-    "gc": _cmd_gc,
+    "gc": _cmd_gc, "pause": _cmd_kanban_pause, "resume": _cmd_kanban_resume,
 }
 
 
@@ -1273,6 +1311,8 @@ Common subcommands:
   `context <id>`        Full worker-context dump
   `runs <id>`           Attempt history
   `log <id>`            Worker log
+  `pause [reason]`      Kanban-only pause (halt new spawns; chat/cron keep running)
+  `resume`              Lift the kanban-only pause
 
 Run `/kanban <subcommand> -h` for arguments. \
 Read-only commands are safe while an agent is running.\

@@ -424,6 +424,10 @@ _SPECS = [
              "class is reported and left untouched (fail-closed). Exits 0 when the DB is healthy "
              "or was repaired, non-zero when it is still corrupt."
          )),
+    _cmd("pause", [_reason("Optional reason stored in the sentinel and shown to users")],
+         help="Kanban-only pause: halt new worker spawns (chat and cron keep running)"),
+    _cmd("resume", [],
+         help="Lift the kanban-only pause set by `hermes kanban pause`"),
 ]
 
 
