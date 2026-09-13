@@ -8093,6 +8093,13 @@ class DispatchResult:
     spawned. ``None`` when memory was fine/unknown and the guard imposed
     no restriction. Reclaim/promotion bookkeeping still ran either way;
     deferred tasks stay queued for the next tick."""
+    spawn_gated: Optional[str] = None
+    """When a ``kanban.spawn_gate`` script is configured and returned PAUSE
+    (non-zero exit) this tick, the message from the gate. ``None`` when no
+    gate is configured or the gate allowed spawning. When set, no ready or
+    review workers were spawned this tick — the gate is re-checked on the
+    next tick, so tasks stay in ``ready`` and spawn automatically once the
+    gate clears (no manual unblock needed)."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -9426,6 +9433,77 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+def _spawn_gate_verdict(board: Optional[str] = None) -> Optional[str]:
+    """Run the configured ``kanban.spawn_gate`` script and return a PAUSE
+    message, or ``None`` when spawning is allowed.
+
+    The gate is a pre-spawn guard: when configured, the dispatcher runs it
+    once per tick BEFORE claiming/spawning any ready or review worker. A
+    non-zero exit (PAUSE) defers all spawns this tick — tasks stay in
+    ``ready`` and are re-checked on the next tick, so they auto-resume the
+    moment the gate clears, with zero worker boots wasted on a PAUSE.
+
+    The gate command is resolved per-board so unrelated boards are never
+    gated by another board's policy:
+
+      1. ``board.json`` ``spawn_gate`` field (per-board, highest precedence)
+      2. global ``kanban.spawn_gate`` config (fallback)
+
+    The value is an absolute path to an executable script (or a command
+    line, split on whitespace). The script is expected to print a human
+    message and exit 0 (RUN) or non-zero (PAUSE). Exit code 2 (UNKNOWN) is
+    treated as PAUSE (fail closed).
+
+    Returns ``None`` when no gate is configured, the script is missing, or
+    the script exits 0. Returns the script's stdout (trimmed) when it
+    exits non-zero. Any error running the script (missing file, non-
+    executable, exception) fails closed to PAUSE with a diagnostic message
+    so a broken gate never silently lets work through.
+    """
+    raw = None
+    # Per-board gate (board.json) wins over the global config fallback.
+    try:
+        raw = read_board_metadata(board).get("spawn_gate")
+    except Exception:
+        raw = None
+    if not raw:
+        try:
+            from hermes_cli.config import load_config_readonly
+            raw = (load_config_readonly() or {}).get("kanban", {}).get("spawn_gate")
+        except Exception:
+            raw = None
+    if not raw:
+        return None
+    cmd = str(raw).strip()
+    if not cmd:
+        return None
+    # Split a command line on whitespace (shlex) so a gate can carry args.
+    import shlex
+    try:
+        argv = shlex.split(cmd)
+    except ValueError:
+        argv = [cmd]
+    if not argv:
+        return None
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except FileNotFoundError:
+        return f"spawn_gate: script not found: {argv[0]}"
+    except subprocess.TimeoutExpired:
+        return f"spawn_gate: timed out: {argv[0]}"
+    except Exception as exc:  # noqa: BLE001 - fail closed on any gate error
+        return f"spawn_gate: error running {argv[0]}: {exc}"
+    if proc.returncode == 0:
+        return None
+    msg = (proc.stdout or proc.stderr or "").strip()
+    return msg or f"spawn_gate: exit {proc.returncode}"
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -9579,7 +9657,8 @@ def check_respawn_guard(
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
+    whose assignee maps to a real Hermes profile AND that is not currently
+    held by a respawn guard.
 
     Used by the gateway- and CLI-embedded dispatchers' health telemetry to
     decide whether ``0 spawned`` is a "stuck" condition (real spawnable
@@ -9587,12 +9666,18 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     lanes like ``orion-cc`` / ``orion-research`` waiting on terminals
     that pull tasks via ``claim_task`` directly).
 
+    A ready task held by a respawn guard (``active_pr``, ``recent_success``,
+    ``rate_limit_cooldown``, ``blocker_auth``) is NOT spawnable this tick —
+    the dispatcher will correctly defer it, so it must not count as "stuck".
+    Without this, a PR-guarded task (e.g. a worker that opened a PR and is
+    waiting on it) fires a false "dispatcher stuck" warning that never clears.
+
     Falls back to "any ready+assigned" if ``profile_exists`` is not
     importable (e.g. partial install) — preserves the old behavior so
     the warning still fires in degraded environments.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
@@ -9604,8 +9689,12 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
     for row in rows:
-        if profile_exists(row["assignee"]):
-            return True
+        if not profile_exists(row["assignee"]):
+            continue
+        # A guard-held task is deferred this tick, not spawnable.
+        if check_respawn_guard(conn, row["id"], lane="ready") is not None:
+            continue
+        return True
     return False
 
 
@@ -10072,6 +10161,19 @@ def _dispatch_once_locked(
                 "limiting to at most 1 new worker this tick"
             )
             spawn_budget = 1
+
+    # Pre-spawn gate (kanban.spawn_gate): when configured, run it once per
+    # tick BEFORE claiming/spawning any worker. A PAUSE (non-zero exit)
+    # defers ALL spawns this tick — tasks stay in ``ready`` and are
+    # re-checked on the next tick, so they auto-resume the moment the gate
+    # clears with zero worker boots wasted. This is the root-cause fix for
+    # the pace-gate re-block loop: previously the gate ran inside the
+    # worker AFTER spawn, so every PAUSE burned a full worker boot.
+    spawn_gate_msg = _spawn_gate_verdict(board=board)
+    if spawn_gate_msg is not None:
+        result.spawn_gated = spawn_gate_msg
+        _log.info("kanban dispatch: spawn gate PAUSE — %s", spawn_gate_msg)
+        return result
 
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
