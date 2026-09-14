@@ -3168,7 +3168,6 @@ def _deliver_result(
     content: str,
     adapters=None,
     loop=None,
-    priority: object = None,
     *,
     for_failure: bool = False,
 ) -> Optional[str]:
@@ -3179,10 +3178,6 @@ def _deliver_result(
     use the live adapter first — this supports E2EE rooms (e.g. Matrix) where
     the standalone HTTP path cannot encrypt.  Falls back to standalone send if
     the adapter path fails or is unavailable.
-
-    ``priority`` (ntfy X-Priority, 1..5) is threaded into delivery metadata /
-    standalone sends when provided; platforms that don't surface priority
-    ignore it.
 
     ``for_failure=True`` routes failure-category engine notices through the
     job's ``failure_deliver`` override when present (NS-788).
@@ -3227,11 +3222,6 @@ def _deliver_result(
     except Exception:
         pass
 
-    # The task name doubles as the notification title on platforms that
-    # surface one (e.g. ntfy's X-Title). Compute it once, before the wrap
-    # block, so it is available whether or not wrapping is enabled.
-    task_name = job.get("name", job.get("id", "cron task"))
-
     # cron.delivery.notify (default True): mark live-adapter cron sends as
     # FINAL notifications so the platform pushes them (Telegram's "important"
     # mode otherwise sends with disable_notification=True). Configurable so
@@ -3245,6 +3235,7 @@ def _deliver_result(
     unverified_targets: list = []
 
     if wrap_response:
+        task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
         delivery_content = (
             f"Cronjob Response: {task_name}\n"
@@ -3706,14 +3697,6 @@ def _deliver_result(
                     # detection when "thread_id"/"message_thread_id" are absent
                     # from metadata, deriving the routing from target.thread_id
                     # or the explicit direct_messages_topic_id above.
-                    #
-                    # The job's task name becomes the notification title on
-                    # platforms that surface one (e.g. ntfy's X-Title header).
-                    # Add it to the live router metadata so
-                    # _deliver_to_platform forwards it to the adapter.
-                    route_metadata["title"] = task_name
-                    if priority is not None:
-                        route_metadata["priority"] = priority
                     future = safe_schedule_threadsafe(
                         router._deliver_to_platform(
                             route_target,
@@ -4034,7 +4017,7 @@ def _deliver_result(
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files, title=task_name, priority=priority)
+            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -4074,7 +4057,7 @@ def _deliver_result(
                         future = pool.submit(
                             _fallback_context.run,
                             asyncio.run,
-                            _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files, title=task_name, priority=priority),
+                            _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files),
                         )
                         result = future.result(timeout=30)
                     finally:
@@ -7752,8 +7735,6 @@ def _run_one_job_body(
                             deliver_content,
                             adapters=adapters,
                             loop=loop,
-                            # ntfy X-Priority: surface failures prominently.
-                            priority=(None if success else 5),
                             # Failure summaries (and drift/blocked-config alerts
                             # composed into deliver_content on the failure path)
                             # honor the job's failure_deliver override (NS-788).
@@ -7930,8 +7911,6 @@ def _run_one_job_body(
                         + _failure_streak_nudge(job),
                         adapters=adapters,
                         loop=loop,
-                        # This is always a failure path — urgent priority.
-                        priority=5,
                         for_failure=True,
                     )
                 except Exception as delivery_exc:
