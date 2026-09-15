@@ -153,7 +153,7 @@ def test_kanban_dispatch_blocked_when_engaged(hermes_home):
 
 def test_kanban_dispatch_blocked_by_kanban_only_pause(hermes_home):
     """`hermes kanban pause` gates the dispatcher, while chat/cron stay up."""
-    from gateway.kanban_watchers_common import _kanban_dispatch_allowed
+    from gateway.kanban_watchers import _kanban_dispatch_allowed
 
     assert _kanban_dispatch_allowed() is True
     estop.kanban_engage(reason="fleet freeze")

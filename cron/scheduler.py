@@ -8226,6 +8226,12 @@ def tick(
         raise
 
     try:
+        # `hermes pause` ESTOP: skip dispatch, never touch in-flight runs; check_paused logs once.
+        with contextlib.suppress(ImportError):
+            from agent.estop import check_paused as _estop_check_paused
+            if _estop_check_paused("cron", logger):
+                return 0
+
         if can_dispatch is not None and not can_dispatch():
             logger.debug("Cron dispatch paused while gateway drains existing work")
             return 0
