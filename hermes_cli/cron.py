@@ -785,8 +785,26 @@ def cron_create(args):
     # raises GatewayLifecycleBlocked, the `cronjob` tool wrapper catches it and
     # returns it as result["error"], and the `if not result.get("success")`
     # branch below prints it in red and exits 1 — same UX as before.
+    #
+    # The dead-store guard (#87033) is the same shared decision, taken here so
+    # the message can name this surface's escape hatch (--allow-dead-store)
+    # rather than the tool's allow_dead_store=True. Having decided, the call
+    # below passes allow_dead_store=True so the tool does not re-run the gate
+    # (and never soft-warns its way past a human's refusal).
+    from tools.cronjob_tools import _dead_store_refusal, _gateway_liveness_notice
+
+    refusal = _dead_store_refusal(
+        _gateway_liveness_notice(),
+        getattr(args, "allow_dead_store", False),
+        override_hint="re-run with --allow-dead-store",
+    )
+    if refusal:
+        print(color(f"Failed to create job: {refusal}", Colors.RED))
+        return 1
+
     result = _cron_api(
         action="create",
+        allow_dead_store=True,
         schedule=args.schedule,
         prompt=args.prompt,
         name=getattr(args, "name", None),

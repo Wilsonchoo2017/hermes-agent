@@ -143,6 +143,19 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         ),
     )
 
+    cron_create.add_argument(
+        "--allow-dead-store",
+        dest="allow_dead_store",
+        action="store_true",
+        default=False,
+        help=(
+            "Create the job even when no gateway is running. The built-in "
+            "ticker lives in the gateway process, so without this flag the "
+            "create is refused rather than storing a job that can never "
+            "fire."
+        ),
+    )
+
     # cron edit
     cron_edit = cron_subparsers.add_parser(
         "edit", help="Edit an existing scheduled job"

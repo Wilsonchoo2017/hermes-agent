@@ -7,6 +7,7 @@ Compatibility wrappers remain for direct Python callers and legacy tests.
 
 import json
 import logging
+import os
 import re
 import sys
 import threading
@@ -1462,6 +1463,16 @@ def _apply_continuity(
     return refs or None
 
 
+# Single source of the dead-store wording (#87033). Shared verbatim by the
+# advisory notice below and by the create refusal (_dead_store_refusal) so the
+# warning path and the refusal path can never drift apart.
+_DEAD_STORE_WARNING = (
+    "The Hermes gateway is not running — {subject} "
+    "but will NOT fire until the gateway is started "
+    "(hermes gateway install / hermes gateway start)."
+)
+
+
 def _gateway_liveness_notice(plural: bool = False) -> dict:
     """Build the ``gateway_running``/``warning`` payload for tool results.
 
@@ -1484,15 +1495,73 @@ def _gateway_liveness_notice(plural: bool = False) -> dict:
         return {
             "gateway_running": False,
             "warning": (
-                f"The Hermes gateway is not running — {subject} "
-                "but will NOT fire until the gateway is started "
-                "(hermes gateway install / hermes gateway start). "
-                "Tell the user the task is scheduled but not active yet."
+                _DEAD_STORE_WARNING.format(subject=subject)
+                + " Tell the user the task is scheduled but not active yet."
             ),
         }
     if _gw is None:
         return {"gateway_running": None}
     return {"gateway_running": True}
+
+
+def _is_kanban_worker_run() -> bool:
+    """True when this process is a dispatcher-spawned kanban/board worker.
+
+    Mirrors the canonical gate used by the kanban toolset
+    (``tools/kanban_tools._check_kanban_mode``): the env var alone is not
+    proof of ownership, because delegate_task children and cron jobs fired
+    in-process from a worker inherit it — ``agent.delegation_context``
+    settles that. Fails open to True (warn, don't refuse) if the probe
+    itself breaks, matching kanban_tools' own fallback.
+    """
+    if not (
+        os.environ.get("HERMES_KANBAN_TASK")
+        or os.environ.get("HERMES_KANBAN_WORKSPACE")
+    ):
+        return False
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        return is_dispatcher_owned_worker_context()
+    except Exception:
+        return True
+
+
+def _dead_store_refusal(
+    notice: dict,
+    allow_dead_store: Optional[bool] = None,
+    override_hint: str = "re-run with allow_dead_store=True",
+) -> Optional[str]:
+    """The one refuse-vs-warn decision for creating an un-fireable job (#87033).
+
+    The builtin ticker only runs inside the gateway process, so a job stored
+    while no gateway is running is dead on arrival — three incidents of
+    "it said it was scheduled and nothing ever happened" came from creating
+    one anyway. Returns the refusal message when the create must be blocked,
+    or ``None`` when it may proceed (the advisory ``warning`` in ``notice``
+    still rides along on the success payload).
+
+    Never refuses when liveness is True (scheduler live), None (probe failed —
+    refusing there would be a false alarm) or the provider is non-builtin
+    (``_builtin_gateway_liveness`` already reports those as alive). Also never
+    refuses for a dispatcher-spawned board worker: a worker scheduling a
+    followup has no human at the prompt to start a gateway, so it gets the
+    loud warning instead of a hard stop.
+
+    ``override_hint`` names the caller's escape hatch (the CLI passes its
+    ``--allow-dead-store`` flag) so the message is actionable on both surfaces.
+    """
+    if notice.get("gateway_running") is not False:
+        return None
+    if allow_dead_store:
+        return None
+    if _is_kanban_worker_run():
+        return None
+    return (
+        _DEAD_STORE_WARNING.format(subject="this job would be saved")
+        + " Refusing to create a job that can never fire: start the gateway "
+        f"and try again, or {override_hint} to schedule it anyway."
+    )
 
 
 def cronjob(
@@ -1521,6 +1590,7 @@ def cronjob(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[Union[str, List[str]]] = None,
+    allow_dead_store: Optional[bool] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1605,6 +1675,15 @@ def cronjob(
                             success=False,
                         )
 
+            # Dead-store guard (#87033): the builtin ticker lives in the
+            # gateway process, so storing a job with no gateway running
+            # schedules something that can never fire. Probe once here and
+            # reuse the same notice for the success payload below.
+            _liveness = _gateway_liveness_notice()
+            _refusal = _dead_store_refusal(_liveness, allow_dead_store)
+            if _refusal:
+                return tool_error(_refusal, success=False, gateway_running=False)
+
             # continuity=True is sugar for context_from including "self":
             # the job wakes up with its own previous run's output injected.
             if continuity is not None:
@@ -1671,7 +1750,7 @@ def cronjob(
                 "next_run_at": job["next_run_at"],
                 "job": _format_job(job),
                 "message": _create_message,
-                **_gateway_liveness_notice(),
+                **_liveness,
             }
             # Mode-specific guidance rides in the create response (once, when
             # relevant) instead of in the schema (every API call). See
@@ -2081,6 +2160,10 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "type": "boolean",
                 "description": "True = each run sees the job's own previous output, so it can dedupe and continue where it left off (scouts, monitors, incremental digests). Default false. On update, false turns it off."
             },
+            "allow_dead_store": {
+                "type": "boolean",
+                "description": "For create only. By default a create is REFUSED when no gateway is running, because the scheduler's ticker lives in the gateway process and the job could never fire. Set true only after telling the user the job will stay inert until they run 'hermes gateway install' / 'hermes gateway start'."
+            },
             "enabled_toolsets": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -2163,6 +2246,7 @@ def _cronjob_handler(args, **kw):
         attach_to_session=args.get("attach_to_session"),
         monitor_script=_mon_script,
         monitor_url=_mon_url,
+        allow_dead_store=args.get("allow_dead_store"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
     )
