@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -8100,6 +8101,16 @@ class DispatchResult:
     review workers were spawned this tick — the gate is re-checked on the
     next tick, so tasks stay in ``ready`` and spawn automatically once the
     gate clears (no manual unblock needed)."""
+    forced: list[tuple[str, str]] = field(default_factory=list)
+    """Ready tasks spawned THROUGH a PAUSEd spawn gate via a verified
+    ``Force:`` override, as ``(task_id, reason)`` pairs where ``reason``
+    is the canonical ``Force:`` value. Only populated when
+    ``spawn_gated`` is also set — the gate held every other ready card.
+    An override is honoured only when the board configures
+    ``spawn_gate_force_token`` in ``board.json`` AND the card carries a
+    matching ``Sig:`` HMAC (see :func:`_forced_override_reason`); the
+    comment author plays no role. Never reuses ``spawned`` so operators
+    and telemetry can tell a gate-override spawn from a normal one."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -9504,6 +9515,64 @@ def _spawn_gate_verdict(board: Optional[str] = None) -> Optional[str]:
     return msg or f"spawn_gate: exit {proc.returncode}"
 
 
+# Field-marker grammar, mirroring fleetctl's ``_FIELD_RE`` (that lives in a
+# separate upstream repo we must not import): a ``Key: value`` line whose
+# label is 1-21 letters/hyphens starting with a letter.
+_MARKER_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z-]{0,20}$")
+
+
+def _scan_marker_fields(text: Optional[str], wanted: tuple[str, ...], into: dict) -> None:
+    """Fold ``Key: value`` lines of ``text`` into ``into`` (first wins)."""
+    for line in (text or "").splitlines():
+        label, sep, value = line.partition(":")
+        if not sep or not _MARKER_KEY_RE.match(label):
+            continue
+        if label in wanted and label not in into:
+            into[label] = value.strip()
+
+
+def _forced_override_reason(
+    conn: sqlite3.Connection, task_id: str, force_token: str
+) -> Optional[str]:
+    """Return the canonical ``Force:`` value when ``task_id`` carries a
+    spawn-gate override that verifies against ``force_token``, else ``None``.
+
+    The ``Force:`` marker is forgeable on its own — any operator (or worker)
+    can write a comment under any author string — so the author is NOT part
+    of the decision. An override counts only when the board configured an
+    opaque ``spawn_gate_force_token`` in ``board.json`` and the card carries
+    a companion ``Sig: <hex>`` equal to
+    ``HMAC-SHA256(force_token, force_value)``, compared in constant time.
+    Boards without a token fail closed: no card is ever forced.
+
+    Markers are read from the task body first, then comments newest→oldest
+    (``list_comments`` is ascending), first occurrence per key winning, so a
+    newer comment supersedes an older one. ``Force`` and ``Sig`` are paired
+    from that single scan: a signature from one comment cannot rescue a
+    ``Force`` the operator later changed.
+
+    The token is a secret: it is never logged or returned.
+    """
+    if not force_token:
+        return None
+    wanted = ("Force", "Sig")
+    fields: dict[str, str] = {}
+    row = conn.execute("SELECT body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    _scan_marker_fields(row["body"] if row is not None else None, wanted, fields)
+    for comment in reversed(list_comments(conn, task_id)):
+        _scan_marker_fields(comment.body, wanted, fields)
+    force = fields.get("Force")
+    sig = fields.get("Sig")
+    if not force or not sig:
+        return None
+    expected = hmac.new(
+        force_token.encode("utf-8"), force.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(expected, sig.strip().lower()):
+        return None
+    return force
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -10169,21 +10238,51 @@ def _dispatch_once_locked(
     # clears with zero worker boots wasted. This is the root-cause fix for
     # the pace-gate re-block loop: previously the gate ran inside the
     # worker AFTER spawn, so every PAUSE burned a full worker boot.
+    #
+    # A PAUSE is overridable per-card: a ready card carrying a ``Force:``
+    # marker with a ``Sig:`` HMAC that verifies against the board's
+    # ``spawn_gate_force_token`` spawns anyway, through the normal ready
+    # loop below (per-profile cap, respawn guard, budgets and the memory
+    # guard all still apply — the override beats the GATE, not safety).
+    # Boards with no token configured fail closed and behave exactly as
+    # before. Read before the gate runs so those boards short-circuit.
+    try:
+        force_token = (
+            read_board_metadata(board=board).get("spawn_gate_force_token") or ""
+        ).strip()
+    except Exception:
+        force_token = ""
+    ready_sql = (
+        "SELECT id, assignee FROM tasks "
+        "WHERE status = 'ready' AND claim_lock IS NULL "
+        "ORDER BY priority DESC, created_at ASC"
+    )
+    forced_reasons: dict[str, str] = {}
     spawn_gate_msg = _spawn_gate_verdict(board=board)
     if spawn_gate_msg is not None:
         result.spawn_gated = spawn_gate_msg
         _log.info("kanban dispatch: spawn gate PAUSE — %s", spawn_gate_msg)
-        return result
+        if force_token:
+            for row in conn.execute(ready_sql).fetchall():
+                reason = _forced_override_reason(conn, row["id"], force_token)
+                if reason is not None:
+                    forced_reasons[row["id"]] = reason
+        if not forced_reasons:
+            return result
+        _log.info(
+            "kanban dispatch: spawn gate override — %d forced card(s)",
+            len(forced_reasons),
+        )
 
-    ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
-    ).fetchall()
+    ready_rows = conn.execute(ready_sql).fetchall()
+    if spawn_gate_msg is not None:
+        # Gate held: only verified forced cards proceed; every other ready
+        # card stays queued exactly as an un-overridden PAUSE would leave it.
+        ready_rows = [row for row in ready_rows if row["id"] in forced_reasons]
     # Review rows are enumerated up front (not after the ready loop) so the
     # budget split below can see whether review work exists at all.
     review_rows = []
-    if review_dispatch_enabled():
+    if review_dispatch_enabled() and spawn_gate_msg is None:
         review_rows = conn.execute(
             "SELECT id, assignee FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
@@ -10359,6 +10458,8 @@ def _dispatch_once_locked(
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
+            if row["id"] in forced_reasons:
+                result.forced.append((row["id"], forced_reasons[row["id"]]))
             spawned += 1
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
@@ -10422,6 +10523,8 @@ def _dispatch_once_locked(
             # counter is cleared only on successful completion (see
             # complete_task).
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
+            if claimed.id in forced_reasons:
+                result.forced.append((claimed.id, forced_reasons[claimed.id]))
             spawned += 1
             # Track the new in-flight count for this profile so later
             # iterations in this same tick respect the per-profile cap
