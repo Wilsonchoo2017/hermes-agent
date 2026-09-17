@@ -525,11 +525,11 @@ def _force_body(reason: str, token: str = FORCE_TOKEN) -> str:
 
 
 def test_scan_marker_fields_matches_field_grammar():
-    """Only well-formed ``Key: value`` labels are picked up, first wins."""
+    """Only well-formed ``Key: value`` labels are picked up, last wins."""
     fields = {}
     kb._scan_marker_fields(
         "Force: first\n"
-        "Force: second\n"          # later duplicate ignored
+        "Force: second\n"          # later duplicate supersedes
         "  Force: indented\n"      # leading space -> not a field label
         "F0rce: digits\n"          # digit in label -> not a field label
         "-Force: leading dash\n"   # must start with a letter
@@ -537,7 +537,7 @@ def test_scan_marker_fields_matches_field_grammar():
         ("Force", "Sig"),
         fields,
     )
-    assert fields == {"Force": "first", "Sig": "abc123"}
+    assert fields == {"Force": "second", "Sig": "abc123"}
 
 
 def test_scan_marker_fields_rejects_overlong_label():
@@ -548,10 +548,23 @@ def test_scan_marker_fields_rejects_overlong_label():
 
 
 def test_forced_override_reason_newest_comment_wins(kanban_home):
-    """Comments are scanned newest→oldest, so a newer Force+Sig supersedes."""
+    """Comments are scanned oldest→newest, so a newer Force+Sig supersedes."""
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="t", assignee="alice")
         kb.add_comment(conn, tid, "wilson", f"Force: old\nSig: {_sig('old')}")
+        kb.add_comment(conn, tid, "wilson", f"Force: new\nSig: {_sig('new')}")
+        assert kb._forced_override_reason(conn, tid, FORCE_TOKEN) == "new"
+
+
+def test_forced_override_reason_newer_comment_supersedes_body(kanban_home):
+    """A newer comment's Force+Sig supersedes a stale marker in the task body."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="t",
+            assignee="alice",
+            body=f"Force: stale\nSig: {_sig('stale')}",
+        )
         kb.add_comment(conn, tid, "wilson", f"Force: new\nSig: {_sig('new')}")
         assert kb._forced_override_reason(conn, tid, FORCE_TOKEN) == "new"
 

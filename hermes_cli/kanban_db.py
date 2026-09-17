@@ -9559,12 +9559,12 @@ _MARKER_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z-]{0,20}$")
 
 
 def _scan_marker_fields(text: Optional[str], wanted: tuple[str, ...], into: dict) -> None:
-    """Fold ``Key: value`` lines of ``text`` into ``into`` (first wins)."""
+    """Fold ``Key: value`` lines of ``text`` into ``into`` (last wins)."""
     for line in (text or "").splitlines():
         label, sep, value = line.partition(":")
         if not sep or not _MARKER_KEY_RE.match(label):
             continue
-        if label in wanted and label not in into:
+        if label in wanted:
             into[label] = value.strip()
 
 
@@ -9582,9 +9582,10 @@ def _forced_override_reason(
     ``HMAC-SHA256(force_token, force_value)``, compared in constant time.
     Boards without a token fail closed: no card is ever forced.
 
-    Markers are read from the task body first, then comments newest→oldest
-    (``list_comments`` is ascending), first occurrence per key winning, so a
-    newer comment supersedes an older one. ``Force`` and ``Sig`` are paired
+    Markers are read from the task body first, then comments oldest→newest
+    (``list_comments`` is ascending), the last occurrence per key winning, so
+    the newest marker on the card wins: a newer comment supersedes an older
+    comment and the always-older body. ``Force`` and ``Sig`` are paired
     from that single scan: a signature from one comment cannot rescue a
     ``Force`` the operator later changed.
 
@@ -9596,7 +9597,7 @@ def _forced_override_reason(
     fields: dict[str, str] = {}
     row = conn.execute("SELECT body FROM tasks WHERE id = ?", (task_id,)).fetchone()
     _scan_marker_fields(row["body"] if row is not None else None, wanted, fields)
-    for comment in reversed(list_comments(conn, task_id)):
+    for comment in list_comments(conn, task_id):
         _scan_marker_fields(comment.body, wanted, fields)
     force = fields.get("Force")
     sig = fields.get("Sig")
