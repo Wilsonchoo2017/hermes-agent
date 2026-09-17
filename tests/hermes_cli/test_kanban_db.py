@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
+import hmac
 import os
 import sqlite3
 import subprocess
@@ -489,6 +491,299 @@ def test_dispatch_spawn_gate_run_allows_spawn(
     assert res.spawned
     assert spawns == [tid]
     assert res.spawn_gated is None
+
+
+# ---------------------------------------------------------------------------
+# Spawn-gate Force: override (HMAC-signed, per-board token)
+# ---------------------------------------------------------------------------
+
+FORCE_TOKEN = "d3adb33fcafe"
+
+
+def _sig(value: str, token: str = FORCE_TOKEN) -> str:
+    """HMAC-SHA256 signature an operator's signing helper would produce."""
+    return hmac.new(token.encode(), value.encode(), hashlib.sha256).hexdigest()
+
+
+def _patch_gate_with_force_token(monkeypatch, tmp_path, *, token=FORCE_TOKEN, gate=True):
+    """PAUSEing per-board gate plus (optionally) a force token in board.json."""
+    meta = {}
+    if gate:
+        script = tmp_path / "gate_pause.sh"
+        script.write_text("#!/bin/sh\necho 'PAUSE: only 7% under pace'\nexit 1\n")
+        script.chmod(0o755)
+        meta["spawn_gate"] = str(script)
+    if token:
+        meta["spawn_gate_force_token"] = token
+    import hermes_cli.config as _cfg
+    monkeypatch.setattr(_cfg, "load_config_readonly", lambda: {})
+    monkeypatch.setattr(kb, "read_board_metadata", lambda board=None: dict(meta))
+
+
+def _force_body(reason: str, token: str = FORCE_TOKEN) -> str:
+    return f"do the thing\nForce: {reason}\nSig: {_sig(reason, token)}\n"
+
+
+def test_scan_marker_fields_matches_field_grammar():
+    """Only well-formed ``Key: value`` labels are picked up, first wins."""
+    fields = {}
+    kb._scan_marker_fields(
+        "Force: first\n"
+        "Force: second\n"          # later duplicate ignored
+        "  Force: indented\n"      # leading space -> not a field label
+        "F0rce: digits\n"          # digit in label -> not a field label
+        "-Force: leading dash\n"   # must start with a letter
+        "Sig: abc123\n",
+        ("Force", "Sig"),
+        fields,
+    )
+    assert fields == {"Force": "first", "Sig": "abc123"}
+
+
+def test_scan_marker_fields_rejects_overlong_label():
+    """Labels longer than 21 characters are not fields."""
+    fields = {}
+    kb._scan_marker_fields("A" * 22 + ": nope\n", ("A" * 22,), fields)
+    assert fields == {}
+
+
+def test_forced_override_reason_newest_comment_wins(kanban_home):
+    """Comments are scanned newest→oldest, so a newer Force+Sig supersedes."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="t", assignee="alice")
+        kb.add_comment(conn, tid, "wilson", f"Force: old\nSig: {_sig('old')}")
+        kb.add_comment(conn, tid, "wilson", f"Force: new\nSig: {_sig('new')}")
+        assert kb._forced_override_reason(conn, tid, FORCE_TOKEN) == "new"
+
+
+def test_forced_override_reason_requires_sig_and_token(kanban_home):
+    """Force with no Sig, and a valid marker with no token, both fail closed."""
+    with kb.connect() as conn:
+        bare = kb.create_task(conn, title="bare", body="Force: ship it")
+        assert kb._forced_override_reason(conn, bare, FORCE_TOKEN) is None
+        signed = kb.create_task(conn, title="signed", body=_force_body("ship it"))
+        assert kb._forced_override_reason(conn, signed, "") is None
+        assert kb._forced_override_reason(conn, signed, FORCE_TOKEN) == "ship it"
+
+
+def test_dispatch_forced_card_spawns_through_paused_gate(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    """A verified Force: card spawns while the gate holds everything else."""
+    _patch_gate_with_force_token(monkeypatch, tmp_path)
+
+    spawns = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        forced = kb.create_task(
+            conn, title="urgent", assignee="alice", body=_force_body("hotfix"),
+        )
+        held = kb.create_task(conn, title="normal", assignee="bob")
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        held_task = kb.get_task(conn, held)
+
+    assert spawns == [forced]
+    assert res.forced == [(forced, "hotfix")]
+    assert [s[0] for s in res.spawned] == [forced]
+    assert res.spawn_gated == "PAUSE: only 7% under pace"
+    # The non-forced card is untouched and stays queued for a later tick.
+    assert held_task is not None
+    assert held_task.status == "ready"
+
+
+def test_dispatch_forced_marker_via_comment_spawns(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    """The override may arrive as a comment on an already-queued card."""
+    _patch_gate_with_force_token(monkeypatch, tmp_path)
+    spawns = []
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="queued", assignee="alice")
+        kb.add_comment(conn, tid, "wilson", f"Force: pace-override\nSig: {_sig('pace-override')}")
+        res = kb.dispatch_once(
+            conn, spawn_fn=lambda task, ws, board=None: spawns.append(task.id) or 7,
+        )
+
+    assert spawns == [tid]
+    assert res.forced == [(tid, "pace-override")]
+
+
+def test_dispatch_forged_signature_does_not_bypass_gate(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    """A Sig: signed under a DIFFERENT token is not an override."""
+    _patch_gate_with_force_token(monkeypatch, tmp_path)
+
+    spawns = []
+
+    with kb.connect() as conn:
+        kb.create_task(
+            conn,
+            title="forged",
+            assignee="alice",
+            body=_force_body("hotfix", token="attacker-token"),
+        )
+        res = kb.dispatch_once(
+            conn, spawn_fn=lambda task, ws, board=None: spawns.append(task.id) or 42,
+        )
+
+    assert not spawns
+    assert not res.forced
+    assert not res.spawned
+    assert res.spawn_gated == "PAUSE: only 7% under pace"
+
+
+def test_dispatch_forced_card_still_respects_per_profile_cap(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    """The override beats the gate, not the per-profile concurrency cap."""
+    _patch_gate_with_force_token(monkeypatch, tmp_path)
+
+    spawns = []
+
+    with kb.connect() as conn:
+        busy = kb.create_task(conn, title="running", assignee="alice")
+        kb.claim_task(conn, busy)
+        # Live pid + no orphan reconciliation so the in-flight card is not
+        # requeued out from under the cap check by the reclaim passes.
+        kb._set_worker_pid(conn, busy, os.getpid())
+        forced = kb.create_task(
+            conn, title="urgent", assignee="alice", body=_force_body("hotfix"),
+        )
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, ws, board=None: spawns.append(task.id) or 42,
+            max_in_progress_per_profile=1,
+            reconcile_orphans=False,
+        )
+
+    assert not spawns
+    assert not res.forced
+    assert [entry[0] for entry in res.skipped_per_profile_capped] == [forced]
+
+
+def test_dispatch_forced_card_still_respects_respawn_guard(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    """The respawn guard still defers a forced spawn."""
+    _patch_gate_with_force_token(monkeypatch, tmp_path)
+
+    spawns = []
+
+    with kb.connect() as conn:
+        forced = kb.create_task(
+            conn, title="urgent", assignee="alice", body=_force_body("hotfix"),
+        )
+        kb.add_comment(
+            conn, forced, "alice",
+            "opened https://github.com/acme/widgets/pull/42 for review",
+        )
+        res = kb.dispatch_once(
+            conn, spawn_fn=lambda task, ws, board=None: spawns.append(task.id) or 42,
+        )
+
+    assert not spawns
+    assert not res.forced
+    assert [entry[0] for entry in res.respawn_guarded] == [forced]
+
+
+def test_dispatch_no_gate_configured_ignores_force_marker(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """No spawn gate at all → normal spawn, nothing reported as forced."""
+    import hermes_cli.config as _cfg
+    monkeypatch.setattr(_cfg, "load_config_readonly", lambda: {})
+    monkeypatch.setattr(kb, "read_board_metadata", lambda board=None: {})
+
+    spawns = []
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="urgent", assignee="alice", body=_force_body("hotfix"),
+        )
+        res = kb.dispatch_once(
+            conn, spawn_fn=lambda task, ws, board=None: spawns.append(task.id) or 42,
+        )
+
+    assert spawns == [tid]
+    assert not res.forced
+    assert res.spawn_gated is None
+
+
+def test_dispatch_token_without_gate_script_is_unaffected(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    """A board with a force token but no gate dispatches normally."""
+    _patch_gate_with_force_token(monkeypatch, tmp_path, gate=False)
+
+    spawns = []
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="urgent", assignee="alice", body=_force_body("hotfix"),
+        )
+        res = kb.dispatch_once(
+            conn, spawn_fn=lambda task, ws, board=None: spawns.append(task.id) or 42,
+        )
+
+    assert spawns == [tid]
+    assert not res.forced
+    assert res.spawn_gated is None
+
+
+def test_dispatch_gate_paused_without_token_defers_forced_card(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    """Gate PAUSE on a board with no token configured: nothing is forced."""
+    _patch_gate_with_force_token(monkeypatch, tmp_path, token=None)
+
+    spawns = []
+
+    with kb.connect() as conn:
+        kb.create_task(
+            conn, title="urgent", assignee="alice", body=_force_body("hotfix"),
+        )
+        res = kb.dispatch_once(
+            conn, spawn_fn=lambda task, ws, board=None: spawns.append(task.id) or 42,
+        )
+
+    assert not spawns
+    assert not res.forced
+    assert res.spawn_gated == "PAUSE: only 7% under pace"
+
+
+def test_completed_forced_card_is_no_longer_force_eligible(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    """Marker expiry: once the card completes it leaves 'ready', so the
+    Force: marker is inert — a later tick forces nothing."""
+    _patch_gate_with_force_token(monkeypatch, tmp_path)
+
+    spawns = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        forced = kb.create_task(
+            conn, title="urgent", assignee="alice", body=_force_body("hotfix"),
+        )
+        first = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        assert first.forced == [(forced, "hotfix")]
+
+        kb.complete_task(conn, forced, result="ok")
+        second = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert spawns == [forced]
+    assert not second.forced
+    assert not second.spawned
+    assert second.spawn_gated == "PAUSE: only 7% under pace"
 
 
 
